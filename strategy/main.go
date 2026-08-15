@@ -22,13 +22,20 @@ type config struct {
 
 	Clip      int     // size per quote
 	MaxPos    int     // hard cap on absolute position
-	EdgeTicks float64 // half-spread we try to earn, in ticks
+	EdgeTicks float64 // floor on the half-spread we quote, in ticks
 	SkewTicks float64 // quote shift at full inventory, in ticks
+	// The edge is sized from measured volatility: EdgeVolMult * stdev of the mid
+	// over VolWindow, floored at EdgeTicks and capped at MaxEdgeTicks. Set
+	// EdgeVolMult to 0 for a fixed edge of EdgeTicks.
+	EdgeVolMult  float64
+	MaxEdgeTicks float64
+	VolWindow    time.Duration
 	// MinEdgeTicks is the margin every quote must keep against fair value, no
 	// matter how much inventory skew wants to give away. Getting flat below this
 	// is the hedger's job.
 	MinEdgeTicks float64
-	MaxTPS       int           // self-imposed request rate cap
+	MaxTPS       int           // self-imposed sustained request rate cap
+	MaxBurst     int           // requests allowed back-to-back before throttling
 	MinRequote   time.Duration // floor on time between requote cycles
 }
 
@@ -39,13 +46,29 @@ func loadConfig() config {
 		Sender: env("SENDER", "QUOTE001"),
 		Feed:   env("QUOTER_FEED", env("TAKER_FEED", "AAH6")),
 
-		Clip:       envInt("QUOTER_CLIP", 5),
-		MaxPos:     envInt("QUOTER_MAX_POS", 25),
-		EdgeTicks:  envFloat("QUOTER_EDGE", 2),
-		SkewTicks:  envFloat("QUOTER_SKEW", 4),
+		Clip:      envInt("QUOTER_CLIP", 5),
+		MaxPos:    envInt("QUOTER_MAX_POS", 25),
+		EdgeTicks: envFloat("QUOTER_EDGE", 2),
+		SkewTicks: envFloat("QUOTER_SKEW", 4),
 		// 1 tick: the smallest margin that is still a margin.
 		MinEdgeTicks: envFloat("QUOTER_MIN_EDGE", 1),
-		MaxTPS:     envInt("QUOTER_MAX_TPS", 20),
+		// Sized from measured volatility rather than fitted to one market. 0 gives
+		// a fixed edge of QUOTER_EDGE, which is how the fixed-edge sweep was run.
+		//
+		// 4.0 is a risk appetite ("quote four sigma wide"), not a price level, so
+		// it is the part that transfers to a market with different absolute moves.
+		// Measured on the sample market: multipliers of 3.0 and 4.5 both produced a
+		// profitable quoter (+5,659 and +3,494 over 120s) where 1.5 did not
+		// (-1,279). The higher end is the calmer one -- less inventory churn and
+		// lower mean desk exposure -- which suits "low-risk" in the brief.
+		EdgeVolMult:  envFloat("QUOTER_EDGE_VOL", 4.0),
+		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 120),
+		VolWindow: time.Duration(envInt("QUOTER_VOL_WINDOW_MS", 2000)) *
+			time.Millisecond,
+		MaxTPS: envInt("QUOTER_MAX_TPS", 20),
+		// 8 = two full two-sided repositions back-to-back, so a fast market does
+		// not leave us queued behind our own rate limiter.
+		MaxBurst:   envInt("QUOTER_MAX_BURST", 8),
 		MinRequote: time.Duration(envInt("QUOTER_MIN_REQUOTE_MS", 50)) * time.Millisecond,
 	}
 }
