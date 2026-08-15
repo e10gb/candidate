@@ -36,5 +36,6 @@ nats sub 'strat.PYTKR001.status'
 | `TAKER_CLIP`  | `3`     | order size per trade                           |
 | `TAKER_MAX_POS`| `30`   | max absolute position                          |
 | `TAKER_THRESH`| `10`    | mid move (price units) that triggers a trade   |
-| `TAKER_LAG`   | `5`     | BBO updates back the move is measured over     |
+| `TAKER_LAG`   | `5`     | distinct top-of-book changes the move spans    |
 | `TAKER_RUN`   | `20`    | seconds to run                                 |
+| `TAKER_COOLDOWN` | `0.5` | minimum seconds between trades               |
