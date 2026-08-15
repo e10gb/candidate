@@ -13,13 +13,14 @@ Config (env):
   TAKER_CLIP      order size per trade         (default 3)
   TAKER_MAX_POS   max absolute position        (default 30)
   TAKER_THRESH    mid move (price units) that triggers a trade (default 10)
-  TAKER_LAG       how many BBO updates back the move is measured (default 5)
+  TAKER_LAG       distinct top-of-book changes the move spans (default 5)
   TAKER_RUN       seconds to run               (default 20)
 """
 import asyncio
 import collections
 import os
 import random
+import time
 
 import nats
 
@@ -34,6 +35,12 @@ MAX_POS = int(os.environ.get("TAKER_MAX_POS", "30"))
 THRESH = int(os.environ.get("TAKER_THRESH", "10"))
 LAG = int(os.environ.get("TAKER_LAG", "5"))
 RUN_S = float(os.environ.get("TAKER_RUN", "20"))
+# Minimum gap between trades. Without it, maybe_trade() fires on every incoming
+# message for as long as the signal holds, turning one move into a burst of
+# orders. It doubles as this seat's rate limit: exceeding the exchange's max_tps
+# disconnects the sender outright (changelog v2.3) rather than rejecting, and this
+# was the only seat with no self-imposed cap at all.
+COOLDOWN = float(os.environ.get("TAKER_COOLDOWN", "0.5"))
 
 
 class Taker:
@@ -47,6 +54,8 @@ class Taker:
         self.cash = 0.0       # signed: buys spend cash, sells receive cash
         self.fills = 0
         self.last_mark = None  # last price we can value inventory against
+        self.last_top = None   # dedupe: the BBO feed republishes unchanged tops
+        self.last_trade_at = 0.0
         self.send_lock = asyncio.Lock()
 
     async def on_md(self, msg):
@@ -87,6 +96,15 @@ class Taker:
         f = msg.data.decode().split()
         if len(f) < 6:
             return
+        # The BBO feed republishes on every book event, not only when the top
+        # changes: measured 154 messages/sec against 24.8 genuine changes/sec.
+        # Recording all of them made TAKER_LAG count *messages* rather than price
+        # moves, so the "move over the last 5 updates" was really the move over
+        # ~32ms of mostly-identical quotes -- a momentum signal measuring noise.
+        top = (f[2], f[3], f[4], f[5])
+        if top == self.last_top:
+            return
+        self.last_top = top
         self.best_bid = None if f[2] == "-" else int(f[2])
         self.best_ask = None if f[4] == "-" else int(f[4])
         m = self.mid()
@@ -98,6 +116,8 @@ class Taker:
     async def maybe_trade(self):
         if len(self.mids) < self.mids.maxlen:
             return
+        if time.monotonic() - self.last_trade_at < COOLDOWN:
+            return
         past, now = self.mids[0], self.mids[-1]
         if now - past >= THRESH and self.position < MAX_POS and self.best_ask is not None:
             await self.take("B")
@@ -106,6 +126,7 @@ class Taker:
 
     async def take(self, side):
         async with self.send_lock:
+            self.last_trade_at = time.monotonic()  # set before the await, not after
             px = self.best_ask if side == "B" else self.best_bid
             oid = self.next_oid()
             order = f"{SENDER} A {FEED} {oid} {side} {CLIP} {px} F"
