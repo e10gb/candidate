@@ -208,18 +208,39 @@ func (q *quoter) desired() (bid, ask target, ok bool) {
 	bid.px = int(math.Round(fair - q.cfg.EdgeTicks - skew))
 	ask.px = int(math.Round(fair + q.cfg.EdgeTicks - skew))
 
-	// Stay passive. A limit order that crosses executes immediately, which would
-	// make us the aggressor and pay the spread we are trying to earn.
-	if bid.px >= q.askPx {
-		bid.px = q.askPx - 1
+	// Minimum-edge floor. Skew is allowed to make the side that flattens us more
+	// attractive, but never past the point where the fill stops being profitable:
+	// with SkewTicks > EdgeTicks the raw skew above quotes straight through fair
+	// value once the position passes MaxPos*EdgeTicks/SkewTicks, so we were paying
+	// to reduce inventory. Clearing inventory at a loss is the hedger's job, and it
+	// can do it in one trade instead of waiting for someone to come to us.
+	//
+	// Only the attractive side is floored. The discouraging side stays unbounded --
+	// quoting stingier than fair is always safe.
+	if cap := int(math.Floor(fair - q.cfg.MinEdgeTicks)); bid.px > cap {
+		bid.px = cap
 	}
-	if ask.px <= q.bidPx {
-		ask.px = q.bidPx + 1
+	if floor := int(math.Ceil(fair + q.cfg.MinEdgeTicks)); ask.px < floor {
+		ask.px = floor
 	}
 
 	// Never quote a size that could take us through the position limit.
 	bid.vol = clamp(q.cfg.Clip, 0, q.cfg.MaxPos-q.position)
 	ask.vol = clamp(q.cfg.Clip, 0, q.cfg.MaxPos+q.position)
+
+	// Stay passive: a limit order that crosses executes immediately, which would
+	// make us the aggressor and pay the spread we are trying to earn. With a
+	// positive MinEdgeTicks the floor above already guarantees this (our bid sits
+	// below fair, which sits below the best ask), so this is a guard rather than a
+	// reprice -- if it ever fires, sitting the side out is right, since any price
+	// that satisfies it would breach the minimum edge. Applied last so it is not
+	// undone by the sizing above.
+	if bid.px >= q.askPx {
+		bid.vol = 0
+	}
+	if ask.px <= q.bidPx {
+		ask.vol = 0
+	}
 	return bid, ask, true
 }
 
