@@ -1,3 +1,7 @@
+// Order entry: everything about talking to the exchange, kept away from the
+// strategy. Order-id generation, self-imposed rate limiting, reply parsing, and
+// the reject codes that mean "already done" rather than "failed".
+
 package main
 
 import (

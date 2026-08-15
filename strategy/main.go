@@ -63,24 +63,27 @@ func loadConfig() config {
 		// Sized from measured volatility rather than fitted to one market. 0 gives
 		// a fixed edge of QUOTER_EDGE, which is how the fixed-edge sweep was run.
 		//
-		// 4.0 is a risk appetite ("quote four sigma wide"), not a price level, so
-		// it is the part that transfers to a market with different absolute moves.
-		// Measured on the sample market: multipliers of 3.0 and 4.5 both produced a
-		// profitable quoter (+5,659 and +3,494 over 120s) where 1.5 did not
-		// (-1,279). The higher end is the calmer one -- less inventory churn and
-		// lower mean desk exposure -- which suits "low-risk" in the brief.
+		// 4.0 is a risk appetite ("quote roughly four sigma wide"), not a price
+		// level, so it is the part that transfers to a market with different
+		// absolute moves. A volatility-sized edge beat the original fixed edge of 2
+		// by about an order of magnitude and repeatably; the choice of multiplier
+		// within the wide range did not separate from run-to-run noise, so 4.0 is a
+		// reasonable point in a broad plateau rather than a tuned optimum. See
+		// NOTES.md for the measurements and the retraction.
 		EdgeVolMult: envFloat("QUOTER_EDGE_VOL", 4.0),
-		// Cap on the edge. 20 measured best and most consistently (+2,071/+1,213
-		// against +880/-4,434 uncapped-ish at 120).
+		// Cap on the edge. Volatility is sampled at requote moments, and we requote
+		// when the market moves, so an uncapped edge is priced off conditional
+		// volatility and runs very wide -- realised quoted spread reached 240
+		// against a market spread of 1-5, which is a quoter that has left the
+		// market. The cap bounds that. Its exact value is not resolvable at the
+		// noise level measured, so 20 is chosen to bound the pathological case, not
+		// as a tuned optimum.
 		//
-		// I first made this a fraction of price, on the reasoning that an absolute
-		// constant will not transfer to an instrument at a different level. It
-		// measured *worse*, twice (-2,834/-3,404), and the mechanism was visible in
-		// the logs: this market's moves are absolute -- the mover steps 20-60
-		// points regardless of price -- so scaling the cap with price tightened it
-		// exactly when prices were low and moves were proportionally largest.
-		// Following the measurement over the aesthetic. MaxEdgeFrac is kept for a
-		// market where risk genuinely scales with price; set one or the other.
+		// MaxEdgeFrac expresses the same cap as a fraction of price, for a market
+		// where risk scales with price level. It is off by default because this
+		// market's moves are absolute (the sim's mover steps 20-60 points whatever
+		// the price), not because it measured worse -- that comparison did not
+		// survive repetition either. Set one or the other.
 		MaxEdgeFrac:  envFloat("QUOTER_MAX_EDGE_FRAC", 0),
 		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 20),
 		VolWindow: time.Duration(envInt("QUOTER_VOL_WINDOW_MS", 2000)) *

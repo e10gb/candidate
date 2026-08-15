@@ -1,3 +1,10 @@
+// Quoting logic: the book and position we believe in, the prices we want, and the
+// reconciliation that turns one into the other.
+//
+// Position and fills come from the exchange's own market-data feed rather than
+// from what we asked for, because a seat that trusts its own requests is how the
+// shipped taker came to report a flat book while trading (see NOTES.md).
+
 package main
 
 import (
@@ -230,10 +237,11 @@ func (q *quoter) pushMid(mid float64) {
 //
 // This is what makes the edge adaptive instead of fitted. A market maker's spread
 // has to cover how far the price moves while it is holding, and that distance is
-// a property of the market, not a constant: measured on the sample market, a fixed
-// edge of 2 lost 8,405 over 120s while 35 made 2,276 -- but 35 is simply this
-// sim's mover step size memorised, and TASK.md says grading uses a different
-// market. Measuring the move and pricing off it transfers; the number does not.
+// a property of the market, not a constant. On the sample market a volatility-
+// sized edge beat the original fixed edge of 2 by roughly an order of magnitude,
+// repeatably. The specific wide value that worked there is just that market's
+// move size memorised, and TASK.md says grading uses a different one: measuring
+// the move and pricing off it transfers, the number does not.
 func (q *quoter) volatility() float64 {
 	if len(q.mids) < 3 {
 		return 0
@@ -256,13 +264,14 @@ func (q *quoter) volatility() float64 {
 // The cap matters more than it sounds. Volatility is sampled at the moments we
 // requote, and we requote when the market moves, so the edge is priced off
 // *conditional* volatility and runs much wider than the unconditional average
-// suggests -- measured median quoted spread of 78 against an expected ~60, with
-// the cap binding regularly. Capping at ~20 measured better than leaving it loose
-// (+2,071/+1,213 against +880/-4,434) and far more consistently.
+// suggests: measured median quoted spread of 78 where the parameters implied ~60,
+// with the cap binding regularly and the widest quotes reaching 240 against a
+// market spread of 1-5.
 //
-// It is expressed as a fraction of the price rather than an absolute, so it
-// transfers to an instrument trading at a different level -- the same reason the
-// edge itself is a volatility multiple rather than a tick count.
+// Two forms are available and only one should be set. MaxEdgeTicks is absolute;
+// MaxEdgeFrac is a fraction of the current price, for a market where risk scales
+// with price level. See NOTES.md -- the choice between them did not separate from
+// noise, so this is a judgement, not a measured result.
 func (q *quoter) edge() float64 {
 	e := q.cfg.EdgeTicks // floor: never quote tighter than this
 	if q.cfg.EdgeVolMult > 0 {
