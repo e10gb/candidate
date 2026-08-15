@@ -62,6 +62,20 @@ risk="$(grep -o 'desk=[-0-9]*' "$tmp/h.log" | cut -d= -f2 | awk -v d="$DURATION"
   END{ if(!n){print "no-data"; exit}
        printf "%d %.2f %.0f %.0f", mx, s/n, 100*o10/n, 100*o25/n }')"
 
+# How wide we actually quoted. Reported rather than inferred from the volatility
+# multiplier: the edge is priced off volatility sampled *at requote moments*,
+# which is higher than the unconditional average, so the realised spread ran far
+# wider than the parameters suggested. Fill rate is the other half of the picture
+# -- a spread nobody crosses earns nothing.
+spread="$(grep -oE 'bid=[0-9]+x[0-9]+ ask=[0-9]+x[0-9]+' "$tmp/q.log" |
+  sed -E 's/bid=([0-9]+)x[0-9]+ ask=([0-9]+)x[0-9]+/\1 \2/' | awk '
+  {w=$2-$1; n++; s+=w; if(w>mx)mx=w; a[n]=w}
+  END{ if(!n){print "- - -"; exit}
+       for(i=1;i<=n;i++)for(j=i+1;j<=n;j++)if(a[j]<a[i]){t=a[i];a[i]=a[j];a[j]=t}
+       printf "%d %.0f %d", a[int(n/2)+1], s/n, mx }')"
+read -r spmed spmean spmax <<<"$spread"
+qfills="$(grep -o 'fills=[0-9]*' "$tmp/q.log" | tail -1 | cut -d= -f2)"
+
 # PnL: each seat marks its own inventory; "n/a" means it could not be valued.
 pnl_of() { grep -o 'pnl=[-0-9]*' "$1" | tail -1 | cut -d= -f2; }
 qp="$(pnl_of "$tmp/q.log")"; tp="$(pnl_of "$tmp/t.log")"; hp="$(pnl_of "$tmp/h.log")"
@@ -73,11 +87,15 @@ total=$(( ${qp:-0} + ${tp:-0} + ${hp:-0} ))
 printf '\n%s\n' "----------------------------------------------------------------"
 printf 'run            : %s (%ss)\n' "$LABEL" "$DURATION"
 printf 'RISK  max|desk|: %-6s mean|desk|: %-7s >=10: %s%%  >=25: %s%%\n' "$mx" "$mean" "$o10" "$o25"
+printf 'QUOTE spread   : median %-5s mean %-5s max %-5s  quoter fills: %s\n' \
+  "$spmed" "$spmean" "$spmax" "${qfills:-0}"
 printf 'PNL   quoter   : %-8s taker: %-8s hedger: %-8s\n' "${qp:-n/a}" "${tp:-n/a}" "${hp:-n/a}"
 printf 'PNL   TOTAL    : %-8s   (hedger lots traded: %s)\n' "$total" "${churn:-0}"
 printf '%s\n' "----------------------------------------------------------------"
 
 # Machine-readable, for collecting a sweep into one table.
-# label,secs,max,mean,pct>=10,pct>=25,quoter,taker,hedger,total,hedger_lots
-printf 'CSV,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-  "$LABEL" "$DURATION" "$mx" "$mean" "$o10" "$o25" "${qp:-}" "${tp:-}" "${hp:-}" "$total" "${churn:-0}"
+# label,secs,max,mean,pct>=10,pct>=25,quoter,taker,hedger,total,hedger_lots,
+# spread_median,spread_mean,spread_max,quoter_fills
+printf 'CSV,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  "$LABEL" "$DURATION" "$mx" "$mean" "$o10" "$o25" "${qp:-}" "${tp:-}" "${hp:-}" "$total" \
+  "${churn:-0}" "$spmed" "$spmean" "$spmax" "${qfills:-0}"
