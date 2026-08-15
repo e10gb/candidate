@@ -1,3 +1,6 @@
+// Tests for the quoting logic. Each one pins a behaviour that was, at some point,
+// wrong in a way that produced plausible-looking output rather than an error.
+
 package main
 
 import (

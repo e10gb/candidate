@@ -1,3 +1,6 @@
+// Tests for order entry: reply parsing, order-id uniqueness, and the rate limiter
+// that must let a burst through without exceeding its sustained budget.
+
 package main
 
 import (

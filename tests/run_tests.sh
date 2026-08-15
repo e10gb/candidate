@@ -108,9 +108,11 @@ run_smoke() {
 
   # PnL must never be reported as bare cash while holding a position.
   local badpnl
-  badpnl=$(grep 'pnl=' "$tmp/q.log" | awk '
-    {for(i=1;i<=NF;i++){if($i~/^pos=/)p=substr($i,5); if($i~/^cash=/)c=substr($i,6); if($i~/^pnl=/)n=substr($i,5)}
-     if(p+0!=0 && n==c) bad++} END{print bad+0}')
+  badpnl=$(awk '{p=""; c=""; n="";
+     for(i=1;i<=NF;i++){if($i~/^pos=/)p=substr($i,5); if($i~/^cash=/)c=substr($i,6); if($i~/^pnl=/)n=substr($i,5)}
+     # fill lines carry pos= alone; without resetting, they inherit the previous
+     # status line and read as unmarked whenever the position was flat
+     if(p!="" && c!="" && n!="" && p+0!=0 && n==c) bad++} END{print bad+0}' "$tmp/q.log")
   want "position always marked into PnL" "$badpnl" "0"
 
   rm -rf "$tmp"
