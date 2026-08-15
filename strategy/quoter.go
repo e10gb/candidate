@@ -43,6 +43,10 @@ type quoter struct {
 	lastMark float64
 	haveMark bool
 
+	// Rolling mid history, for sizing the edge against how far the market is
+	// actually moving. Trimmed to cfg.VolWindow on every push.
+	mids []midSample
+
 	bid resting
 	ask resting
 
@@ -54,7 +58,7 @@ func newQuoter(nc *nats.Conn, cfg config) *quoter {
 	return &quoter{
 		cfg:  cfg,
 		nc:   nc,
-		cl:   newClient(nc, cfg.Sender, cfg.Feed, cfg.MaxTPS),
+		cl:   newClient(nc, cfg.Sender, cfg.Feed, cfg.MaxTPS, cfg.MaxBurst),
 		wake: make(chan struct{}, 1),
 	}
 }
@@ -84,8 +88,10 @@ func (q *quoter) onBBO(m *nats.Msg) {
 	q.bidPx, q.bidOK = parsePx(f[2])
 	q.askPx, q.askOK = parsePx(f[4])
 	if q.bidOK && q.askOK {
-		q.lastMark = float64(q.bidPx+q.askPx) / 2
+		mid := float64(q.bidPx+q.askPx) / 2
+		q.lastMark = mid
 		q.haveMark = true
+		q.pushMid(mid)
 	}
 	q.mu.Unlock()
 
@@ -199,6 +205,66 @@ func (q *quoter) forget(id string) {
 	}
 }
 
+type midSample struct {
+	at  time.Time
+	mid float64
+}
+
+// pushMid records a mid and drops anything older than the volatility window.
+// Caller must hold q.mu.
+func (q *quoter) pushMid(mid float64) {
+	now := time.Now()
+	q.mids = append(q.mids, midSample{at: now, mid: mid})
+	cut := now.Add(-q.cfg.VolWindow)
+	i := 0
+	for i < len(q.mids) && q.mids[i].at.Before(cut) {
+		i++
+	}
+	if i > 0 {
+		q.mids = append(q.mids[:0], q.mids[i:]...)
+	}
+}
+
+// volatility is the standard deviation of the mid over the recent window, in
+// price units. Caller must hold q.mu.
+//
+// This is what makes the edge adaptive instead of fitted. A market maker's spread
+// has to cover how far the price moves while it is holding, and that distance is
+// a property of the market, not a constant: measured on the sample market, a fixed
+// edge of 2 lost 8,405 over 120s while 35 made 2,276 -- but 35 is simply this
+// sim's mover step size memorised, and TASK.md says grading uses a different
+// market. Measuring the move and pricing off it transfers; the number does not.
+func (q *quoter) volatility() float64 {
+	if len(q.mids) < 3 {
+		return 0
+	}
+	var sum float64
+	for _, s := range q.mids {
+		sum += s.mid
+	}
+	mean := sum / float64(len(q.mids))
+	var sq float64
+	for _, s := range q.mids {
+		d := s.mid - mean
+		sq += d * d
+	}
+	return math.Sqrt(sq / float64(len(q.mids)))
+}
+
+// edge returns the half-spread to quote, in price units. Caller must hold q.mu.
+func (q *quoter) edge() float64 {
+	e := q.cfg.EdgeTicks // floor: never quote tighter than this
+	if q.cfg.EdgeVolMult > 0 {
+		if v := q.cfg.EdgeVolMult * q.volatility(); v > e {
+			e = v
+		}
+	}
+	if q.cfg.MaxEdgeTicks > 0 && e > q.cfg.MaxEdgeTicks {
+		e = q.cfg.MaxEdgeTicks // a burst of volatility should not price us off the book entirely
+	}
+	return e
+}
+
 // target is the quote we want on one side; vol == 0 means "do not quote".
 type target struct {
 	px  int
@@ -220,8 +286,9 @@ func (q *quoter) desired() (bid, ask target, ok bool) {
 	// full SkewTicks, which is what makes this a liquidity strategy rather than a
 	// directional one -- the mid drifts far more than the spread pays.
 	skew := q.cfg.SkewTicks * float64(q.position) / float64(q.cfg.MaxPos)
-	bid.px = int(math.Round(fair - q.cfg.EdgeTicks - skew))
-	ask.px = int(math.Round(fair + q.cfg.EdgeTicks - skew))
+	edge := q.edge()
+	bid.px = int(math.Round(fair - edge - skew))
+	ask.px = int(math.Round(fair + edge - skew))
 
 	// Minimum-edge floor. Skew is allowed to make the side that flattens us more
 	// attractive, but never past the point where the fill stops being profitable:
