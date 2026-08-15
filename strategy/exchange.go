@@ -134,6 +134,23 @@ func (c *client) add(side byte, vol, px int, typ byte) (string, int, error) {
 	return id, r.n, nil
 }
 
+// Reject codes that both mean "this order is not resting on the book", which is
+// precisely the state cancel() is trying to reach. Distinguished by experiment:
+//
+//	206 orderid not used   -- this sender never used the id at all
+//	305 orderid not active -- the id was used, but the order has since been
+//	                          cancelled or filled
+//
+// Neither is an error for us. 305 shows up routinely in the full-stack run when a
+// fill and a requote race: the fill removes the order a moment before we ask to
+// cancel it. Treating it as a failure made reconcile bail out while still holding
+// a record of an order that no longer exists, so that side stopped being requoted
+// until an unrelated C message happened to clear it.
+const (
+	rejectOrderIDUnused = 206
+	rejectOrderInactive = 305
+)
+
 // cancel removes one resting order by id.
 //
 // Deliberately not using X (cancel-many): it does not reliably select by
@@ -146,9 +163,7 @@ func (c *client) cancel(id string) error {
 	if err != nil {
 		return err
 	}
-	// 206 "orderid not used" means it is already gone (filled or cancelled);
-	// that is the state we wanted, so it is not an error.
-	if !r.ok && r.code != 206 {
+	if !r.ok && r.code != rejectOrderIDUnused && r.code != rejectOrderInactive {
 		return fmt.Errorf("cancel %s rejected: %s", id, r)
 	}
 	return nil
