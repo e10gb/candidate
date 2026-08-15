@@ -53,7 +53,13 @@ run_protocol() {
   docker compose up -d >/dev/null 2>&1
   sleep 5
   docker build -q -t desk-test-py ./hedger >/dev/null
-  if docker run --rm --network candidate_default -e NATS_URL=nats://nats:4222 \
+  # Compose names the network after the directory, so it is not a constant:
+  # ask the running nats container which network it is actually on.
+  local net
+  net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' \
+        "$(docker compose ps -q nats)" 2>/dev/null)
+  if [ -z "$net" ]; then bad "could not find the compose network"; return; fi
+  if docker run --rm --network "$net" -e NATS_URL=nats://nats:4222 \
        -v "$PWD/tests":/t -w /t desk-test-py python3 test_protocol.py; then
     ok "protocol assertions"
   else
