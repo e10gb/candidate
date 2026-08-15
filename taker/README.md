@@ -31,7 +31,7 @@ nats sub 'strat.PYTKR001.status'
 
 | Var           | Default | Meaning                                        |
 |---------------|---------|------------------------------------------------|
-| `TAKER_FEED`  | `BTH6`  | contract to trade                              |
+| `TAKER_FEED`  | `AAH6`  | contract to trade                              |
 | `TAKER_SENDER`| `PYTKR001` | 8-char sender tag                           |
 | `TAKER_CLIP`  | `3`     | order size per trade                           |
 | `TAKER_MAX_POS`| `30`   | max absolute position                          |
