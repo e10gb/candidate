@@ -14,7 +14,7 @@ func testCfg() config {
 		Clip:         5,
 		MaxPos:       25,
 		EdgeTicks:    2,
-		SkewTicks:    4,
+		SkewFrac:     1.0,
 		MinEdgeTicks: 1,
 		EdgeVolMult:  0, // fixed edge unless a test opts in
 		MaxEdgeFrac:  0, // caps off unless a test opts in
@@ -84,6 +84,53 @@ func TestSkewLeansAgainstInventory(t *testing.T) {
 	if longBid.px >= shortBid.px {
 		t.Errorf("long should bid stingier than short: long bid %d, short bid %d",
 			longBid.px, shortBid.px)
+	}
+}
+
+// Skew is a fraction of the *current* edge, so the lean keeps its intended
+// strength whatever the edge happens to be. It used to be an absolute tick count
+// chosen when the edge was 2, which left it doing almost nothing once the edge
+// became volatility-sized -- the quoter stopped managing its own inventory and
+// pushed the work onto the hedger, which pays the spread to do the same job.
+func TestSkewScalesWithTheEdge(t *testing.T) {
+	lean := func(edge float64) float64 {
+		cfg := testCfg()
+		cfg.EdgeTicks = edge // no vol history, so the edge is the floor
+		cfg.SkewFrac = 1.0
+		q := newTestQuoter(t, cfg, 1000-int(edge)-5, 1000+int(edge)+5)
+		q.position = cfg.MaxPos / 2 // half inventory -> half a lean
+		bid, _, ok := q.desired()
+		if !ok {
+			t.Fatalf("edge %.0f: expected a quote", edge)
+		}
+		// Unskewed the bid would sit at fair-edge; the lean is how much further.
+		return (1000 - edge) - float64(bid.px)
+	}
+
+	narrow, wide := lean(4), lean(40)
+	if narrow <= 0 || wide <= 0 {
+		t.Fatalf("expected a downward lean when long, got %.1f and %.1f", narrow, wide)
+	}
+	if ratio := wide / narrow; ratio < 8 || ratio > 12 {
+		t.Errorf("lean should scale with the edge (10x here), got %.1fx "+
+			"(narrow %.1f, wide %.1f)", ratio, narrow, wide)
+	}
+}
+
+// At full inventory the flattening side is pulled a whole edge toward fair, and
+// held exactly MinEdgeTicks off it -- attractive as possible, still profitable.
+func TestFullInventoryLeansToTheMinimumEdge(t *testing.T) {
+	cfg := testCfg()
+	cfg.EdgeTicks = 20
+	cfg.SkewFrac = 1.0
+	q := newTestQuoter(t, cfg, 975, 1025) // fair 1000
+	q.position = cfg.MaxPos               // maximum long: we want to sell
+	_, ask, ok := q.desired()
+	if !ok {
+		t.Fatal("expected a quote")
+	}
+	if want := 1000 + int(cfg.MinEdgeTicks); ask.px != want {
+		t.Errorf("ask should sit at the minimum edge above fair (%d), got %d", want, ask.px)
 	}
 }
 

@@ -23,7 +23,11 @@ type config struct {
 	Clip      int     // size per quote
 	MaxPos    int     // hard cap on absolute position
 	EdgeTicks float64 // floor on the half-spread we quote, in ticks
-	SkewTicks float64 // quote shift at full inventory, in ticks
+	// SkewFrac is the inventory lean at full position, as a fraction of the
+	// current edge. 1.0 means that at MaxPos the flattening side is pulled a
+	// whole edge toward fair (then held off it by MinEdgeTicks), while the
+	// discouraging side moves a whole edge away.
+	SkewFrac float64
 	// The edge is sized from measured volatility: EdgeVolMult * stdev of the mid
 	// over VolWindow, floored at EdgeTicks and capped at MaxEdgeTicks. Set
 	// EdgeVolMult to 0 for a fixed edge of EdgeTicks.
@@ -53,7 +57,7 @@ func loadConfig() config {
 		Clip:      envInt("QUOTER_CLIP", 5),
 		MaxPos:    envInt("QUOTER_MAX_POS", 25),
 		EdgeTicks: envFloat("QUOTER_EDGE", 2),
-		SkewTicks: envFloat("QUOTER_SKEW", 4),
+		SkewFrac:  envFloat("QUOTER_SKEW_FRAC", 1.0),
 		// 1 tick: the smallest margin that is still a margin.
 		MinEdgeTicks: envFloat("QUOTER_MIN_EDGE", 1),
 		// Sized from measured volatility rather than fitted to one market. 0 gives
@@ -124,8 +128,8 @@ func main() {
 		log.Fatalf("connect %s: %v", cfg.NatsURL, err)
 	}
 	defer nc.Close()
-	log.Printf("%s quoting %s clip=%d maxpos=%d edge=%.1f skew=%.1f",
-		cfg.Sender, cfg.Feed, cfg.Clip, cfg.MaxPos, cfg.EdgeTicks, cfg.SkewTicks)
+	log.Printf("%s quoting %s clip=%d maxpos=%d edgefloor=%.1f skewfrac=%.1f",
+		cfg.Sender, cfg.Feed, cfg.Clip, cfg.MaxPos, cfg.EdgeTicks, cfg.SkewFrac)
 
 	q := newQuoter(nc, cfg)
 

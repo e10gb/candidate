@@ -301,21 +301,28 @@ func (q *quoter) desired() (bid, ask target, ok bool) {
 	}
 
 	fair := float64(q.bidPx+q.askPx) / 2
-	// Inventory skew: push both quotes away from the position we are carrying, so
-	// the side that flattens us is the attractive one. At MaxPos the shift is a
-	// full SkewTicks, which is what makes this a liquidity strategy rather than a
-	// directional one -- the mid drifts far more than the spread pays.
-	skew := q.cfg.SkewTicks * float64(q.position) / float64(q.cfg.MaxPos)
 	edge := q.edge()
+	// Inventory skew: push both quotes away from the position we are carrying, so
+	// the side that flattens us is the attractive one. This is what makes it a
+	// liquidity strategy rather than a directional one -- the mid drifts far more
+	// than the spread pays.
+	//
+	// Expressed as a fraction of the *current edge*, not an absolute tick count.
+	// It was absolute (4 ticks) and chosen when the edge was a fixed 2, i.e. a 200%
+	// lean at full inventory. Once the edge became volatility-sized and capped at
+	// 20, that same 4 was a 20% lean and the quoter had all but stopped managing
+	// its own inventory -- pushing the work onto the hedger, which pays the spread
+	// to do what skew does for free.
+	skew := q.cfg.SkewFrac * edge * float64(q.position) / float64(q.cfg.MaxPos)
 	bid.px = int(math.Round(fair - edge - skew))
 	ask.px = int(math.Round(fair + edge - skew))
 
 	// Minimum-edge floor. Skew is allowed to make the side that flattens us more
-	// attractive, but never past the point where the fill stops being profitable:
-	// with SkewTicks > EdgeTicks the raw skew above quotes straight through fair
-	// value once the position passes MaxPos*EdgeTicks/SkewTicks, so we were paying
-	// to reduce inventory. Clearing inventory at a loss is the hedger's job, and it
-	// can do it in one trade instead of waiting for someone to come to us.
+	// attractive, but never past the point where the fill stops being profitable.
+	// At SkewFrac=1.0 and full inventory the lean is a whole edge, which puts the
+	// flattening side exactly on fair -- this floor is what holds it off. Paying to
+	// reduce inventory is the hedger's job, and it can do it in one trade instead
+	// of waiting for someone to come to us.
 	//
 	// Only the attractive side is floored. The discouraging side stays unbounded --
 	// quoting stingier than fair is always safe.
