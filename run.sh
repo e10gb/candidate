@@ -15,6 +15,18 @@ for a in "$@"; do
     *) echo "unknown option: $a" >&2; exit 1 ;;
   esac
 done
+# Leave a record of every run in runs/, so a session's outcome does not depend on
+# anyone having watched the terminal. Runs on exit, including Ctrl-C: `up` without
+# -d stops the containers but does not remove them, so their logs are still
+# readable. Never allowed to affect the exit status of the run itself.
+summarise() {
+  local status=$?
+  [ -x ./tools/run_summary.sh ] && ./tools/run_summary.sh || true
+  return $status
+}
+trap summarise EXIT
+
 # --build: always rebuild from source so edits take effect (compose would
 # otherwise happily reuse a stale image built from older code).
-exec docker compose "${profiles[@]}" up --build
+# Not `exec`: that would replace this shell and the summary would never run.
+docker compose "${profiles[@]}" up --build
