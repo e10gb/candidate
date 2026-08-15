@@ -76,6 +76,15 @@ spread="$(grep -oE 'bid=[0-9]+x[0-9]+ ask=[0-9]+x[0-9]+' "$tmp/q.log" |
 read -r spmed spmean spmax <<<"$spread"
 qfills="$(grep -o 'fills=[0-9]*' "$tmp/q.log" | tail -1 | cut -d= -f2)"
 
+# How well the quoter manages its own inventory. This is the direct measure of
+# whether skew is working, and it is a distribution over the whole run rather
+# than a path-dependent sum, so it is far less noisy than PnL. A quoter that
+# leans properly sits near zero; one that does not leaves the work to the hedger.
+qpos="$(grep -o 'pos=[-0-9]*' "$tmp/q.log" | cut -d= -f2 | awk '
+  {n++; a=($1<0?-$1:$1); s+=a; if(a>mx)mx=a}
+  END{ if(!n){print "- -"; exit} printf "%.2f %d", s/n, mx }')"
+read -r qposmean qposmax <<<"$qpos"
+
 # PnL: each seat marks its own inventory; "n/a" means it could not be valued.
 pnl_of() { grep -o 'pnl=[-0-9]*' "$1" | tail -1 | cut -d= -f2; }
 qp="$(pnl_of "$tmp/q.log")"; tp="$(pnl_of "$tmp/t.log")"; hp="$(pnl_of "$tmp/h.log")"
@@ -89,13 +98,14 @@ printf 'run            : %s (%ss)\n' "$LABEL" "$DURATION"
 printf 'RISK  max|desk|: %-6s mean|desk|: %-7s >=10: %s%%  >=25: %s%%\n' "$mx" "$mean" "$o10" "$o25"
 printf 'QUOTE spread   : median %-5s mean %-5s max %-5s  quoter fills: %s\n' \
   "$spmed" "$spmean" "$spmax" "${qfills:-0}"
+printf 'QUOTER invtry  : mean |pos| %-6s max |pos| %s\n' "$qposmean" "$qposmax"
 printf 'PNL   quoter   : %-8s taker: %-8s hedger: %-8s\n' "${qp:-n/a}" "${tp:-n/a}" "${hp:-n/a}"
 printf 'PNL   TOTAL    : %-8s   (hedger lots traded: %s)\n' "$total" "${churn:-0}"
 printf '%s\n' "----------------------------------------------------------------"
 
 # Machine-readable, for collecting a sweep into one table.
 # label,secs,max,mean,pct>=10,pct>=25,quoter,taker,hedger,total,hedger_lots,
-# spread_median,spread_mean,spread_max,quoter_fills
-printf 'CSV,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+# spread_median,spread_mean,spread_max,quoter_fills,qpos_mean,qpos_max
+printf 'CSV,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
   "$LABEL" "$DURATION" "$mx" "$mean" "$o10" "$o25" "${qp:-}" "${tp:-}" "${hp:-}" "$total" \
-  "${churn:-0}" "$spmed" "$spmean" "$spmax" "${qfills:-0}"
+  "${churn:-0}" "$spmed" "$spmean" "$spmax" "${qfills:-0}" "$qposmean" "$qposmax"
