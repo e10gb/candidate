@@ -32,6 +32,10 @@ services:
     build: ./sim
     environment:
       NATS_URL: nats://nats:4222
+      # Fixed seed so benchmark runs face a comparable price path. Not perfectly
+      # reproducible -- the sim is threaded and timing-dependent -- but far closer
+      # than independent random paths.
+      SIM_SEED: ${SIM_SEED:-1}
     depends_on:
       - exchange
     restart: on-failure
@@ -51,6 +55,17 @@ services:
       HEDGER_SENDER: ${HEDGER_SENDER:-HEDGE001}
       TAKER_FEED: AAH6
       TAKER_RUN: "86400"
+      # Strategy tuning, passed through so tools/bench.sh can sweep it. An empty
+      # value means "use the seat's own default", which is where the real defaults
+      # live -- they are not duplicated here.
+      QUOTER_EDGE: ${QUOTER_EDGE:-}
+      QUOTER_SKEW: ${QUOTER_SKEW:-}
+      QUOTER_MIN_EDGE: ${QUOTER_MIN_EDGE:-}
+      QUOTER_CLIP: ${QUOTER_CLIP:-}
+      QUOTER_MAX_POS: ${QUOTER_MAX_POS:-}
+      HEDGE_THRESH: ${HEDGE_THRESH:-}
+      HEDGE_CLIP: ${HEDGE_CLIP:-}
+      HEDGE_SLIP: ${HEDGE_SLIP:-}
     depends_on:
       - exchange
     restart: on-failure
