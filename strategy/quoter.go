@@ -100,9 +100,14 @@ func (q *quoter) onOwnMD(m *nats.Msg) {
 		return
 	}
 	switch f[1] {
-	case "E":
-		// <ts> E <incoming:17> <resting:17> <volume> <price> <matchid> <B|S>
-		// Only E is handled: T reports the same trade again and would double-count.
+	case "E", "T":
+		// <ts> <E|T> <incoming:17> <resting:17> <volume> <price> <matchid> <B|S>
+		//
+		// Not duplicates: our subject carries E when we were the resting side of a
+		// match and T when we crossed. We are built to stay passive, so E is the
+		// normal case, but a limit order can still cross if the book moves between
+		// reading the BBO and the order landing -- handling only E would silently
+		// lose those fills and leave the position wrong.
 		if len(f) < 8 {
 			return
 		}
