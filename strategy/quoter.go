@@ -50,7 +50,7 @@ type quoter struct {
 	bid resting
 	ask resting
 
-	quoteMu sync.Mutex   // serialises requote cycles
+	quoteMu sync.Mutex    // serialises requote cycles
 	wake    chan struct{} // coalescing signal: capacity 1
 }
 
