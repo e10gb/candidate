@@ -46,11 +46,25 @@ SEATS = {
     "taker": os.environ.get("TAKER_SENDER", "PYTKR001"),
     "hedger": SENDER,
 }
-THRESH = int(os.environ.get("HEDGE_THRESH", "5"))
-CLIP = int(os.environ.get("HEDGE_CLIP", "25"))
-SLIP = int(os.environ.get("HEDGE_SLIP", "10"))
-INTERVAL = float(os.environ.get("HEDGE_INTERVAL", "0.05"))
-MAX_TPS = int(os.environ.get("HEDGE_MAX_TPS", "20"))
+def env(key, default, cast):
+    """Read a numeric setting. Treats unset and empty the same, so a compose
+    pass-through like `HEDGE_THRESH: ${HEDGE_THRESH:-}` falls back to the default
+    rather than crashing on int("")."""
+    raw = os.environ.get(key, "")
+    if raw == "":
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"[hedger] bad {key}={raw!r}; using {default}", flush=True)
+        return default
+
+
+THRESH = env("HEDGE_THRESH", 5, int)
+CLIP = env("HEDGE_CLIP", 25, int)
+SLIP = env("HEDGE_SLIP", 10, int)
+INTERVAL = env("HEDGE_INTERVAL", 0.05, float)
+MAX_TPS = env("HEDGE_MAX_TPS", 20, int)
 
 BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -85,6 +99,7 @@ class Hedger:
         self.hedges = 0
         self.traded = 0
         self.cash = 0
+        self.last_mark = None   # last price we can value inventory against
         self.last_send = 0.0
         self.min_gap = 1.0 / MAX_TPS if MAX_TPS > 0 else 0.0
 
@@ -127,6 +142,7 @@ class Hedger:
             vol, px = int(f[4]), int(f[5])
             signed = vol if side == "B" else -vol
             self.positions[seat] += signed
+            self.last_mark = float(px)   # any seat's trade is a valid mark
             if seat == "hedger":
                 self.cash -= signed * px
                 # This fill is confirmed, so retire it from the in-flight bridge.
@@ -207,12 +223,37 @@ class Hedger:
 
     # ---- reporting --------------------------------------------------------- #
 
+    def mark(self):
+        """Price used to value our own inventory. Falls back to the side we would
+        have to trade against, then to the last price seen -- never valuing a live
+        position at zero, which would report cash as profit."""
+        if self.best_bid is not None and self.best_ask is not None:
+            return (self.best_bid + self.best_ask) / 2
+        own = self.positions["hedger"]
+        if own > 0 and self.best_bid is not None:
+            return float(self.best_bid)
+        if own < 0 and self.best_ask is not None:
+            return float(self.best_ask)
+        return self.last_mark
+
+    def pnl(self):
+        """Our own mark-to-market. This is the *cost of the risk control*: the
+        hedger crosses the spread every time, so it is expected to be negative.
+        It is worth measuring precisely because it is the price paid for the flat
+        desk position, and the two must be traded off against each other."""
+        m = self.mark()
+        if m is None:
+            return None
+        return self.cash + self.positions["hedger"] * m
+
     async def report_loop(self):
         while True:
             await asyncio.sleep(1.0)
             pos = " ".join(f"{k}={v}" for k, v in self.positions.items())
+            p = self.pnl()
             s = (f"desk={self.desk()} {pos} inflight={self.inflight} "
-                 f"hedges={self.hedges} traded={self.traded} cash={self.cash}")
+                 f"hedges={self.hedges} traded={self.traded} cash={self.cash} "
+                 f"pnl={'n/a' if p is None else format(p, '.0f')}")
             print(f"[hedger] {s}", flush=True)
             await self.nc.publish(f"strat.{SENDER}.status", s.encode())
 
