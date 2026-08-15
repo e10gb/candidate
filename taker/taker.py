@@ -8,7 +8,7 @@ second on `strat.<sender>.status`.
 
 Config (env):
   NATS_URL        default nats://127.0.0.1:4222
-  TAKER_FEED      contract to trade            (default BTH6)
+  TAKER_FEED      contract to trade            (default AAH6)
   TAKER_SENDER    8-char sender tag            (default PYTKR001)
   TAKER_CLIP      order size per trade         (default 3)
   TAKER_MAX_POS   max absolute position        (default 30)
@@ -24,7 +24,10 @@ import random
 import nats
 
 NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
-FEED = os.environ.get("TAKER_FEED", "BTH6")
+# BTH6 was the default and is not a listed instrument (see
+# exchange/instruments.txt), so an unconfigured local run got 202 bad feedcode on
+# every order -- another way this went quiet rather than loud.
+FEED = os.environ.get("TAKER_FEED", "AAH6")
 SENDER = os.environ.get("TAKER_SENDER", "PYTKR001")
 CLIP = int(os.environ.get("TAKER_CLIP", "3"))
 MAX_POS = int(os.environ.get("TAKER_MAX_POS", "30"))
@@ -43,7 +46,32 @@ class Taker:
         self.position = 0
         self.cash = 0.0       # signed: buys spend cash, sells receive cash
         self.fills = 0
+        self.last_mark = None  # last price we can value inventory against
         self.send_lock = asyncio.Lock()
+
+    async def on_md(self, msg):
+        """Book fills from the exchange's own record of what matched.
+
+        <ts> <E|T> <incoming:17> <resting:17> <volume> <price> <matchid> <B|S>
+
+        A seat receives E on its own subject when it was the *resting* side of a
+        match and T when it was the aggressor -- they are not duplicates of one
+        another. This strategy only ever crosses with F, so T is the normal case,
+        but both are handled so a change of order type cannot silently lose fills.
+        One order can also produce several messages; they accumulate.
+        """
+        f = msg.data.decode().split()
+        if len(f) < 8 or f[1] not in ("E", "T"):
+            return
+        prefix = SENDER + ":"
+        if f[2].startswith(prefix):
+            side = f[7]                              # we crossed: aggressor's side
+        elif f[3].startswith(prefix):
+            side = "S" if f[7] == "B" else "B"       # we rested: the other side
+        else:
+            return
+        self.apply_fill(side, int(f[4]), int(f[5]))
+        self.fills += 1
 
     def next_oid(self):
         self.oid += 1
@@ -82,33 +110,67 @@ class Taker:
             oid = self.next_oid()
             order = f"{SENDER} A {FEED} {oid} {side} {CLIP} {px} F"
             try:
-                reply = await self.nc.request("ex.req", order.encode(), timeout=1.0)
-            except Exception:
-                return  # timed out; treat as no fill
+                # The exchange listens on `ex.req.>`, which does not match a
+                # subject with no trailing token. This used to publish to bare
+                # `ex.req`, so every order got "no responders" and the strategy
+                # never traded at all -- silently, because the failure was
+                # swallowed by a bare except.
+                reply = await self.nc.request(f"ex.req.{SENDER}", order.encode(),
+                                              timeout=1.0)
+            except Exception as e:
+                print(f"[taker] order failed: {e}", flush=True)
+                return
             parts = reply.data.decode().split()
-            # parts looks like ["EXCHANGE", "Y", "<n>"] on accept or
-            # ["EXCHANGE", "N", "<code>", ...] on reject. parts[2] is just an
-            # exchange-side detail field; for accepted orders we don't need it.
+            # ["EXCHANGE", "Y", "<n>"] on accept, ["EXCHANGE", "N", "<code>", ...]
+            # on reject.
             if len(parts) >= 2 and parts[1] == "Y":
-                # Fill-and-kill orders are marketable: they cross the spread and
-                # fill in full against the resting book, so the size we asked for
-                # is the size we got.
-                filled = CLIP
-                self.apply_fill(side, filled, px)
-                self.fills += 1
+                # <n> is the volume that actually traded (F fills *partially*,
+                # despite CHANGELOG v2.3). We deliberately do not book the fill
+                # here: the reply gives volume but not price, and a marketable
+                # order is filled at the resting orders' prices, not at our limit.
+                # Booking `filled * px` overstated every buy and understated every
+                # sell -- measured 60s: this reported cash=-22820 where the
+                # exchange's own feed said -7731. Fills are booked in on_md below,
+                # from what actually traded.
+                pass
+            elif len(parts) >= 3:
+                print(f"[taker] rejected {parts[2]}: {' '.join(parts[3:])}", flush=True)
 
     def apply_fill(self, side, qty, px):
-        signed = qty if side == "B" else qty
+        # Both branches used to be `qty`, so a sell was booked as a buy: position
+        # and cash were wrong in opposite directions on every sale.
+        signed = qty if side == "B" else -qty
         self.position += signed
         self.cash -= signed * px
+        self.last_mark = float(px)   # a real trade is a valid mark
+
+    def mark(self):
+        """Price used to value inventory.
+
+        Falls back to the side we would have to trade against, then to the last
+        price seen. The old pnl() valued the position at zero whenever the mid was
+        unavailable, which silently reported cash as profit -- and the sample
+        market's book does go empty (see NOTES.md).
+        """
+        m = self.mid()
+        if m is not None:
+            return m
+        if self.position > 0 and self.best_bid is not None:
+            return float(self.best_bid)      # long: we would sell into the bid
+        if self.position < 0 and self.best_ask is not None:
+            return float(self.best_ask)      # short: we would buy from the ask
+        return self.last_mark
 
     def pnl(self):
-        m = self.mid()
-        return self.cash + (self.position * m if m is not None else 0)
+        m = self.mark()
+        if m is None:
+            return None          # cannot value the position; say so, do not guess
+        return self.cash + self.position * m
 
     async def publish_status(self):
+        p = self.pnl()
         s = (f"pos={self.position} cash={self.cash:.0f} "
-             f"pnl={self.pnl():.0f} fills={self.fills}")
+             f"pnl={'n/a' if p is None else format(p, '.0f')} fills={self.fills}")
         print(f"[taker] {s}", flush=True)
         await self.nc.publish(f"strat.{SENDER}.status", s.encode())
 
@@ -122,13 +184,17 @@ async def main():
     nc = await nats.connect(NATS_URL)
     t = Taker(nc)
     await nc.subscribe(f"ex.bbo.{FEED}", cb=t.on_bbo)
+    # Our own fills, as the exchange recorded them.
+    await nc.subscribe(f"ex.md.{FEED}.{SENDER}", cb=t.on_md)
     print(f"[taker] {SENDER} trading {FEED} clip={CLIP} thresh={THRESH} "
           f"for {RUN_S}s", flush=True)
     rep = asyncio.create_task(t.reporter())
     await asyncio.sleep(RUN_S)
     rep.cancel()
     await t.publish_status()
-    print(f"[taker] final: position={t.position} pnl={t.pnl():.0f} "
+    p = t.pnl()
+    print(f"[taker] final: position={t.position} "
+          f"pnl={'n/a' if p is None else format(p, '.0f')} "
           f"fills={t.fills}", flush=True)
     await nc.drain()
 
