@@ -34,30 +34,62 @@ type client struct {
 	subj   string // ex.req.<sender> -- the exchange listens on ex.req.>, and a
 	// request to bare "ex.req" silently gets no responders (the bug in taker.py).
 
-	mu       sync.Mutex
-	nextID   uint64
-	interval time.Duration // minimum gap between requests
-	last     time.Time
+	mu     sync.Mutex
+	nextID uint64
+
+	// Token bucket, not fixed spacing between requests. Repricing both sides is
+	// cancel+add twice, and with a fixed 1/maxTPS gap that serialised into ~200ms
+	// of forced waiting while sitting on stale quotes -- despite the measured
+	// sustained rate being 8/sec against a budget of 20. A bucket lets a burst
+	// through immediately and still bounds the sustained rate, which is the thing
+	// that actually risks the disconnect.
+	tokens float64
+	burst  float64
+	rate   float64 // tokens per second
+	last   time.Time
 }
 
-func newClient(nc *nats.Conn, sender, feed string, maxTPS int) *client {
-	interval := time.Duration(0)
-	if maxTPS > 0 {
-		interval = time.Second / time.Duration(maxTPS)
-	}
+func newClient(nc *nats.Conn, sender, feed string, maxTPS, maxBurst int) *client {
 	return &client{
 		nc:     nc,
 		sender: sender,
 		feed:   feed,
 		subj:   "ex.req." + sender,
+		rate:   float64(maxTPS),
+		burst:  float64(maxBurst),
 		// Order ids are consumed permanently per sender -- cancelling does not
 		// free them (reject 203). Seeding from the wall clock means a container
 		// restart resumes above every id the previous run burned. Milliseconds
 		// since epoch is ~1.8e12, comfortably inside the 36^8 = 2.8e12 that fits
 		// in the protocol's 8 characters (good until ~2059).
-		nextID:   uint64(time.Now().UnixMilli()),
-		interval: interval,
+		nextID: uint64(time.Now().UnixMilli()),
+		tokens: float64(maxBurst), // start full: the first reposition should not wait
 	}
+}
+
+// reserve takes one token and returns how long the caller must wait for it.
+// Letting tokens go negative is deliberate: it queues concurrent callers instead
+// of letting them all decide independently that they may go now.
+func (c *client) reserve() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rate <= 0 {
+		return 0 // unlimited
+	}
+	now := time.Now()
+	if c.last.IsZero() {
+		c.last = now
+	}
+	c.tokens += now.Sub(c.last).Seconds() * c.rate
+	if c.tokens > c.burst {
+		c.tokens = c.burst
+	}
+	c.last = now
+	c.tokens--
+	if c.tokens >= 0 {
+		return 0
+	}
+	return time.Duration(-c.tokens / c.rate * float64(time.Second))
 }
 
 const base36 = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -79,14 +111,9 @@ func (c *client) newOrderID() string {
 // rejecting, so we throttle ourselves regardless of what the local
 // instruments file says the limit is.
 func (c *client) request(msg string) (reply, error) {
-	c.mu.Lock()
-	if c.interval > 0 {
-		if wait := c.interval - time.Since(c.last); wait > 0 {
-			time.Sleep(wait)
-		}
-		c.last = time.Now()
+	if wait := c.reserve(); wait > 0 {
+		time.Sleep(wait)
 	}
-	c.mu.Unlock()
 
 	m, err := c.nc.Request(c.subj, []byte(msg), time.Second)
 	if err != nil {
