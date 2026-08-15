@@ -252,6 +252,17 @@ func (q *quoter) volatility() float64 {
 }
 
 // edge returns the half-spread to quote, in price units. Caller must hold q.mu.
+//
+// The cap matters more than it sounds. Volatility is sampled at the moments we
+// requote, and we requote when the market moves, so the edge is priced off
+// *conditional* volatility and runs much wider than the unconditional average
+// suggests -- measured median quoted spread of 78 against an expected ~60, with
+// the cap binding regularly. Capping at ~20 measured better than leaving it loose
+// (+2,071/+1,213 against +880/-4,434) and far more consistently.
+//
+// It is expressed as a fraction of the price rather than an absolute, so it
+// transfers to an instrument trading at a different level -- the same reason the
+// edge itself is a volatility multiple rather than a tick count.
 func (q *quoter) edge() float64 {
 	e := q.cfg.EdgeTicks // floor: never quote tighter than this
 	if q.cfg.EdgeVolMult > 0 {
@@ -259,8 +270,17 @@ func (q *quoter) edge() float64 {
 			e = v
 		}
 	}
+	// Reference price for the cap comes from the same samples as the volatility,
+	// so the two can never be derived from different state.
+	if q.cfg.MaxEdgeFrac > 0 && len(q.mids) > 0 {
+		if ref := q.mids[len(q.mids)-1].mid; ref > 0 {
+			if cap := q.cfg.MaxEdgeFrac * ref; e > cap {
+				e = cap
+			}
+		}
+	}
 	if q.cfg.MaxEdgeTicks > 0 && e > q.cfg.MaxEdgeTicks {
-		e = q.cfg.MaxEdgeTicks // a burst of volatility should not price us off the book entirely
+		e = q.cfg.MaxEdgeTicks // optional absolute backstop; off by default
 	}
 	return e
 }

@@ -17,6 +17,7 @@ func testCfg() config {
 		SkewTicks:    4,
 		MinEdgeTicks: 1,
 		EdgeVolMult:  0, // fixed edge unless a test opts in
+		MaxEdgeFrac:  0, // caps off unless a test opts in
 		MaxEdgeTicks: 120,
 		VolWindow:    2 * time.Second,
 		MaxTPS:       20,
@@ -87,7 +88,10 @@ func TestSkewLeansAgainstInventory(t *testing.T) {
 }
 
 func TestNoQuoteWithoutTwoSidedBook(t *testing.T) {
-	for _, tc := range []struct{ name string; bidOK, askOK bool }{
+	for _, tc := range []struct {
+		name         string
+		bidOK, askOK bool
+	}{
 		{"no bid", false, true},
 		{"no ask", true, false},
 		{"empty book", false, false},
@@ -142,6 +146,38 @@ func TestEdgeScalesWithVolatility(t *testing.T) {
 	}
 	if wild > cfg.MaxEdgeTicks {
 		t.Errorf("edge %.1f exceeded the cap %.0f", wild, cfg.MaxEdgeTicks)
+	}
+}
+
+// The cap is a fraction of price so it transfers to an instrument at a different
+// level: the same 3.3% must give a wider absolute edge on a dearer contract. The
+// reference is the latest mid, i.e. what the contract is worth right now.
+func TestEdgeCapScalesWithPriceLevel(t *testing.T) {
+	cfg := testCfg()
+	cfg.EdgeVolMult = 4
+	cfg.MaxEdgeFrac = 0.033
+	cfg.MaxEdgeTicks = 0
+
+	// capAt drives volatility high enough that the cap must bind, ending on `last`.
+	capAt := func(last float64) float64 {
+		q := newTestQuoter(t, cfg, int(last)-2, int(last)+2)
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		for _, m := range []float64{last * 0.7, last * 1.3, last * 0.7, last} {
+			q.pushMid(m)
+		}
+		return q.edge()
+	}
+
+	for _, last := range []float64{600, 6000} {
+		want := cfg.MaxEdgeFrac * last
+		if got := capAt(last); got < want-0.5 || got > want+0.5 {
+			t.Errorf("at price %.0f the cap should be ~%.1f, got %.1f", last, want, got)
+		}
+	}
+
+	if capAt(6000) <= capAt(600)*5 {
+		t.Error("the cap must scale with the price level, not stay constant")
 	}
 }
 

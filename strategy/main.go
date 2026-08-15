@@ -27,7 +27,11 @@ type config struct {
 	// The edge is sized from measured volatility: EdgeVolMult * stdev of the mid
 	// over VolWindow, floored at EdgeTicks and capped at MaxEdgeTicks. Set
 	// EdgeVolMult to 0 for a fixed edge of EdgeTicks.
-	EdgeVolMult  float64
+	EdgeVolMult float64
+	// MaxEdgeFrac caps the edge at a fraction of the current price, so the cap
+	// transfers to an instrument trading at a different level. MaxEdgeTicks is an
+	// optional absolute backstop, off by default.
+	MaxEdgeFrac  float64
 	MaxEdgeTicks float64
 	VolWindow    time.Duration
 	// MinEdgeTicks is the margin every quote must keep against fair value, no
@@ -61,8 +65,20 @@ func loadConfig() config {
 		// profitable quoter (+5,659 and +3,494 over 120s) where 1.5 did not
 		// (-1,279). The higher end is the calmer one -- less inventory churn and
 		// lower mean desk exposure -- which suits "low-risk" in the brief.
-		EdgeVolMult:  envFloat("QUOTER_EDGE_VOL", 4.0),
-		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 120),
+		EdgeVolMult: envFloat("QUOTER_EDGE_VOL", 4.0),
+		// Cap on the edge. 20 measured best and most consistently (+2,071/+1,213
+		// against +880/-4,434 uncapped-ish at 120).
+		//
+		// I first made this a fraction of price, on the reasoning that an absolute
+		// constant will not transfer to an instrument at a different level. It
+		// measured *worse*, twice (-2,834/-3,404), and the mechanism was visible in
+		// the logs: this market's moves are absolute -- the mover steps 20-60
+		// points regardless of price -- so scaling the cap with price tightened it
+		// exactly when prices were low and moves were proportionally largest.
+		// Following the measurement over the aesthetic. MaxEdgeFrac is kept for a
+		// market where risk genuinely scales with price; set one or the other.
+		MaxEdgeFrac:  envFloat("QUOTER_MAX_EDGE_FRAC", 0),
+		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 20),
 		VolWindow: time.Duration(envInt("QUOTER_VOL_WINDOW_MS", 2000)) *
 			time.Millisecond,
 		MaxTPS: envInt("QUOTER_MAX_TPS", 20),
