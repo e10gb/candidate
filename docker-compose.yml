@@ -59,7 +59,7 @@ services:
       # value means "use the seat's own default", which is where the real defaults
       # live -- they are not duplicated here.
       QUOTER_EDGE: ${QUOTER_EDGE:-}
-      QUOTER_SKEW: ${QUOTER_SKEW:-}
+      QUOTER_SKEW_FRAC: ${QUOTER_SKEW_FRAC:-}
       QUOTER_MIN_EDGE: ${QUOTER_MIN_EDGE:-}
       QUOTER_EDGE_VOL: ${QUOTER_EDGE_VOL:-}
       QUOTER_MAX_EDGE: ${QUOTER_MAX_EDGE:-}
