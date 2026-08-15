@@ -38,6 +38,11 @@ type quoter struct {
 	cash     int64 // signed; buying spends cash, selling receives it
 	fills    int
 
+	// Last price we can value inventory against, kept so a book that goes empty
+	// or one-sided does not leave us unable to mark a position at all.
+	lastMark float64
+	haveMark bool
+
 	bid resting
 	ask resting
 
@@ -78,6 +83,10 @@ func (q *quoter) onBBO(m *nats.Msg) {
 	q.lastTop = top
 	q.bidPx, q.bidOK = parsePx(f[2])
 	q.askPx, q.askOK = parsePx(f[4])
+	if q.bidOK && q.askOK {
+		q.lastMark = float64(q.bidPx+q.askPx) / 2
+		q.haveMark = true
+	}
 	q.mu.Unlock()
 
 	q.signal()
@@ -166,6 +175,7 @@ func (q *quoter) applyFill(side byte, vol, px int, id string) {
 		q.cash += int64(vol) * int64(px)
 	}
 	q.fills++
+	q.lastMark, q.haveMark = float64(px), true // a real trade is a valid mark
 	// Decrement the resting order this filled against. F orders fill partially
 	// and so do resting limits, so a fill does not mean the order is gone.
 	for _, r := range []*resting{&q.bid, &q.ask} {
@@ -353,14 +363,50 @@ func (q *quoter) cancelAll() {
 
 // status reports position and mark-to-market PnL once a second, mirroring the
 // taker's strat.<sender>.status convention.
+// markPrice values inventory. Preference order: the live mid; the side we would
+// actually have to trade against to get flat; the last price we saw. Staleness is
+// reported to the caller rather than hidden.
+//
+// The previous version added position*mid only when the book happened to be
+// two-sided, and otherwise reported raw cash as PnL. In the full-stack run the
+// book emptied and it printed pnl=9065 while short 14 lots; the real figure was
+// about -385. A valuation that silently drops the position is worse than none.
+//
+// Caller must hold q.mu.
+func (q *quoter) markPrice() (px float64, fresh, ok bool) {
+	switch {
+	case q.bidOK && q.askOK:
+		return float64(q.bidPx+q.askPx) / 2, true, true
+	case q.position > 0 && q.bidOK:
+		return float64(q.bidPx), true, true // long: we would have to sell into the bid
+	case q.position < 0 && q.askOK:
+		return float64(q.askPx), true, true // short: we would have to buy from the ask
+	case q.bidOK:
+		return float64(q.bidPx), true, true
+	case q.askOK:
+		return float64(q.askPx), true, true
+	case q.haveMark:
+		return q.lastMark, false, true // no book at all: last price we saw
+	}
+	return 0, false, false
+}
+
 func (q *quoter) status() string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	pnl := float64(q.cash)
-	if q.bidOK && q.askOK {
-		pnl += float64(q.position) * float64(q.bidPx+q.askPx) / 2
+
+	mark, fresh, ok := q.markPrice()
+	pnl := "n/a" // no position can be valued and we are not flat: say so
+	switch {
+	case q.position == 0:
+		pnl = fmt.Sprintf("%d", q.cash) // nothing to mark; cash is the whole story
+	case ok:
+		pnl = fmt.Sprintf("%.0f", float64(q.cash)+float64(q.position)*mark)
+		if !fresh {
+			pnl += "?" // valued against a stale price -- flagged, not hidden
+		}
 	}
-	return fmt.Sprintf("pos=%d cash=%d pnl=%.0f fills=%d bid=%s ask=%s",
+	return fmt.Sprintf("pos=%d cash=%d pnl=%s fills=%d bid=%s ask=%s",
 		q.position, q.cash, pnl, q.fills, fmtQuote(q.bid), fmtQuote(q.ask))
 }
 
