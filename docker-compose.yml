@@ -55,6 +55,16 @@ services:
       HEDGER_SENDER: ${HEDGER_SENDER:-HEDGE001}
       TAKER_FEED: AAH6
       TAKER_RUN: "86400"
+      # Desk layout, chosen from measurement (NOTES.md "market-speed campaign"):
+      # the quoter sits on a quieter sibling and prices it off whichever contract
+      # leads (auto-detected); the taker keeps the front month; the hedger
+      # watches every contract and hedges the combined exposure in the liquid
+      # front. Quoting the front itself measured -10,002 +/- 4,702 per 240s
+      # (its aggressive flow is one informed sweeper), the sibling +13,173
+      # +/- 6,066. This bets the grading market lists the same complex -- the
+      # same bet the shipped TAKER_FEED=AAH6 above already makes.
+      QUOTER_FEED: ${QUOTER_FEED:-AAM6}
+      HEDGER_FEED: ${HEDGER_FEED:-AAH6}
       # Strategy tuning, passed through so tools/bench.sh can sweep it. An empty
       # value means "use the seat's own default", which is where the real defaults
       # live -- they are not duplicated here.
@@ -62,10 +72,13 @@ services:
       QUOTER_SKEW_FRAC: ${QUOTER_SKEW_FRAC:-}
       QUOTER_MIN_EDGE: ${QUOTER_MIN_EDGE:-}
       QUOTER_EDGE_VOL: ${QUOTER_EDGE_VOL:-}
-      QUOTER_MAX_EDGE: ${QUOTER_MAX_EDGE:-}
+      QUOTER_MAX_EDGE: ${QUOTER_MAX_EDGE:-40}
       QUOTER_VOL_WINDOW_MS: ${QUOTER_VOL_WINDOW_MS:-}
+      QUOTER_USE_REF: ${QUOTER_USE_REF:-}
+      QUOTER_TIERS: ${QUOTER_TIERS:-}
       QUOTER_CLIP: ${QUOTER_CLIP:-}
       QUOTER_MAX_POS: ${QUOTER_MAX_POS:-}
+      QUOTER_MAX_TPS: ${QUOTER_MAX_TPS:-}
       HEDGE_THRESH: ${HEDGE_THRESH:-}
       HEDGE_CLIP: ${HEDGE_CLIP:-}
       HEDGE_SLIP: ${HEDGE_SLIP:-}
