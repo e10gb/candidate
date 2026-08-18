@@ -14,6 +14,69 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// meta is one instrument's EX_META record: the exchange's own statement of the
+// contract's trading parameters. The seats had never read it -- every limit in
+// the desk was a hardcoded guess, which is wrong in both directions: a rate cap
+// guessed too high gets the sender disconnected in a market with a lower limit,
+// and one guessed too low leaves the quoter reacting at a fraction of the
+// market's real cadence, which is what being picked off is.
+type meta struct {
+	tickSize      int
+	maxTPS        int
+	positionLimit int
+}
+
+// parseMeta reads the KV value: space-separated key=value pairs, integers
+// throughout (PROTOCOL.md "Instrument metadata").
+func parseMeta(s string) meta {
+	m := meta{tickSize: 1}
+	for _, f := range strings.Fields(s) {
+		k, v, ok := strings.Cut(f, "=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			continue
+		}
+		switch k {
+		case "ticksize":
+			if n > 0 {
+				m.tickSize = n
+			}
+		case "max_tps":
+			m.maxTPS = n
+		case "position_limit":
+			m.positionLimit = n
+		}
+	}
+	return m
+}
+
+// fetchMeta reads the feed's EX_META entry, retrying briefly because on a fresh
+// stack the exchange may not have created the bucket before this seat connects.
+func fetchMeta(nc *nats.Conn, feed string, wait time.Duration) (meta, error) {
+	js, err := nc.JetStream()
+	if err != nil {
+		return meta{tickSize: 1}, err
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		kv, kerr := js.KeyValue("EX_META")
+		if kerr == nil {
+			if e, gerr := kv.Get(feed); gerr == nil {
+				return parseMeta(string(e.Value())), nil
+			} else {
+				kerr = gerr
+			}
+		}
+		if time.Now().After(deadline) {
+			return meta{tickSize: 1}, kerr
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 // reply is a parsed exchange response: "<TAG> Y <n>" or "<TAG> N <code> <text>".
 type reply struct {
 	ok   bool

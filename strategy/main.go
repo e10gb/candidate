@@ -42,9 +42,23 @@ type config struct {
 	// matter how much inventory skew wants to give away. Getting flat below this
 	// is the hedger's job.
 	MinEdgeTicks float64
-	MaxTPS       int           // self-imposed sustained request rate cap
-	MaxBurst     int           // requests allowed back-to-back before throttling
-	MinRequote   time.Duration // floor on time between requote cycles
+	// Tiers of quotes per side. 2 posts a tight small inner quote as well as the
+	// wide one, to earn calm-market flow that a single wide quote forfeits.
+	Tiers         int
+	InnerEdgeFrac float64 // inner tier's edge, as a fraction of the full edge
+	InnerSizeFrac float64 // inner tier's size, as a fraction of the clip
+	// Price off whichever sibling contract on the same underlying is most active,
+	// if any is more active than the one we quote. Discovered at runtime rather
+	// than configured, so it needs no knowledge of the grading market's listings.
+	UseRef     bool
+	BasisAlpha float64       // EWMA weight for the learned lead-to-ours offset
+	RefStale   time.Duration // ignore the lead if it has not updated within this
+	// MaxTPS < 0 means auto: derive the cap from the exchange's own EX_META
+	// max_tps at startup, with headroom. 0 means explicitly unlimited.
+	MaxTPS     int
+	MaxBurst   int           // requests allowed back-to-back before throttling
+	MinRequote time.Duration // floor on time between requote cycles
+	TickSize   int           // price grid, from EX_META; 1 on the local exchange
 }
 
 func loadConfig() config {
@@ -88,11 +102,60 @@ func loadConfig() config {
 		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 20),
 		VolWindow: time.Duration(envInt("QUOTER_VOL_WINDOW_MS", 2000)) *
 			time.Millisecond,
-		MaxTPS: envInt("QUOTER_MAX_TPS", 20),
+		// Trialled at 2 and measured worse, so it ships off. A tight inner quote
+		// tripled the fill count and halved the realised spread exactly as
+		// intended, but the extra flow was not profitable: the quoter's own PnL did
+		// not improve, the inventory it generated pushed hedger volume from ~236 to
+		// ~620 lots, and mean desk exposure rose from 1.7 to 2.6-2.9 in both runs.
+		// The easy flow in this market is easy because it is adversely selected.
+		// Kept configurable -- in a market with more benign two-way flow it is the
+		// right shape.
+		UseRef:     envInt("QUOTER_USE_REF", 1) != 0,
+		BasisAlpha: envFloat("QUOTER_BASIS_ALPHA", 0.05),
+		RefStale: time.Duration(envInt("QUOTER_REF_STALE_MS", 2000)) *
+			time.Millisecond,
+		Tiers:         envInt("QUOTER_TIERS", 1),
+		InnerEdgeFrac: envFloat("QUOTER_INNER_EDGE_FRAC", 0.4),
+		InnerSizeFrac: envFloat("QUOTER_INNER_SIZE_FRAC", 0.4),
+		// Auto by default: the exchange states its per-feed limit in EX_META and
+		// the desk had been guessing instead of asking. Locally max_tps is 0
+		// (unlimited), so auto runs the quoter at the market's own event
+		// frequency; in a market that declares a limit, applyMeta sizes the
+		// bucket under it.
+		MaxTPS: envInt("QUOTER_MAX_TPS", -1),
 		// 8 = two full two-sided repositions back-to-back, so a fast market does
 		// not leave us queued behind our own rate limiter.
-		MaxBurst:   envInt("QUOTER_MAX_BURST", 8),
-		MinRequote: time.Duration(envInt("QUOTER_MIN_REQUOTE_MS", 50)) * time.Millisecond,
+		MaxBurst: envInt("QUOTER_MAX_BURST", 8),
+		// 0: the wake channel already coalesces bursts, so a sleep here only
+		// added latency between a fair-value move and our reprice. The sim's own
+		// quoters reprice on every front-month tick; the 50ms this used to hold
+		// was our largest self-inflicted share of the pick-off window.
+		MinRequote: time.Duration(envInt("QUOTER_MIN_REQUOTE_MS", 0)) * time.Millisecond,
+		TickSize:   1,
+	}
+}
+
+// applyMeta folds the exchange's declared limits into the config.
+//
+// A token bucket with burst B and refill rate r admits at most B + r*T requests
+// in any window of length T. The enforcement window of the grading exchange is
+// unknown and breaching max_tps disconnects the sender, so r is sized at half
+// and B at three-tenths of the declared limit: any one-second window then stays
+// at or under 0.8*max_tps.
+func applyMeta(cfg *config, mt meta) {
+	if mt.tickSize > 0 {
+		cfg.TickSize = mt.tickSize
+	}
+	if mt.positionLimit > 0 && mt.positionLimit < cfg.MaxPos {
+		cfg.MaxPos = mt.positionLimit
+	}
+	if cfg.MaxTPS < 0 { // auto
+		if mt.maxTPS > 0 {
+			cfg.MaxTPS = max(1, mt.maxTPS/2)
+			cfg.MaxBurst = max(1, min(cfg.MaxBurst, (mt.maxTPS*3)/10))
+		} else {
+			cfg.MaxTPS = 0 // the exchange declares no limit: run at market speed
+		}
 	}
 }
 
@@ -134,10 +197,26 @@ func main() {
 	log.Printf("%s quoting %s clip=%d maxpos=%d edgefloor=%.1f skewfrac=%.1f",
 		cfg.Sender, cfg.Feed, cfg.Clip, cfg.MaxPos, cfg.EdgeTicks, cfg.SkewFrac)
 
+	mt, err := fetchMeta(nc, cfg.Feed, 20*time.Second)
+	if err != nil {
+		log.Printf("EX_META unavailable (%v); configured defaults apply", err)
+	}
+	applyMeta(&cfg, mt)
+	log.Printf("meta %s: tick=%d max_tps=%d poslim=%d -> rate=%d burst=%d maxpos=%d",
+		cfg.Feed, mt.tickSize, mt.maxTPS, mt.positionLimit,
+		cfg.MaxTPS, cfg.MaxBurst, cfg.MaxPos)
+
 	q := newQuoter(nc, cfg)
 
 	if _, err := nc.Subscribe("ex.bbo."+cfg.Feed, q.onBBO); err != nil {
 		log.Fatalf("subscribe bbo: %v", err)
+	}
+	if cfg.UseRef {
+		// Every contract's top of book, so the leading sibling can be identified
+		// from activity instead of being configured.
+		if _, err := nc.Subscribe("ex.bbo.*", q.onAnyBBO); err != nil {
+			log.Fatalf("subscribe reference bbo: %v", err)
+		}
 	}
 	// Our own fills, straight from the exchange.
 	if _, err := nc.Subscribe("ex.md."+cfg.Feed+"."+cfg.Sender, q.onOwnMD); err != nil {

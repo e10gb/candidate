@@ -54,8 +54,27 @@ type quoter struct {
 	// actually moving. Trimmed to cfg.VolWindow on every push.
 	mids []midSample
 
-	bid resting
-	ask resting
+	// A reference instrument that leads ours, if configured. Our own book can be
+	// stale: a correlated contract that moves first tells us where fair value has
+	// gone before our own top of book catches up, which is the difference between
+	// quoting and being picked off.
+	refMid   float64
+	refOK    bool
+	refAt    time.Time
+	basis    float64 // EWMA of (our mid - reference mid)
+	basisSet bool
+
+	// Which sibling contract leads, chosen by observation rather than
+	// configuration: update counts per feed, and the current pick.
+	ticks   map[string]int
+	refFeed string
+
+	// One resting order per tier per side. Tier 0 is the inner quote when two
+	// tiers are configured: tight and small, to earn the calm-market flow that a
+	// single wide quote forfeits. The outer tier carries the size and sits far
+	// enough out to survive a sweep.
+	bids []resting
+	asks []resting
 
 	quoteMu sync.Mutex    // serialises requote cycles
 	wake    chan struct{} // coalescing signal: capacity 1
@@ -63,10 +82,13 @@ type quoter struct {
 
 func newQuoter(nc *nats.Conn, cfg config) *quoter {
 	return &quoter{
-		cfg:  cfg,
-		nc:   nc,
-		cl:   newClient(nc, cfg.Sender, cfg.Feed, cfg.MaxTPS, cfg.MaxBurst),
-		wake: make(chan struct{}, 1),
+		cfg:   cfg,
+		nc:    nc,
+		cl:    newClient(nc, cfg.Sender, cfg.Feed, cfg.MaxTPS, cfg.MaxBurst),
+		wake:  make(chan struct{}, 1),
+		bids:  make([]resting, cfg.Tiers),
+		asks:  make([]resting, cfg.Tiers),
+		ticks: map[string]int{},
 	}
 }
 
@@ -103,6 +125,103 @@ func (q *quoter) onBBO(m *nats.Msg) {
 	q.mu.Unlock()
 
 	q.signal()
+}
+
+// onAnyBBO watches every contract's top of book so the leading one can be picked
+// by observation. Feeds on the same underlying share a two-character prefix
+// (PROTOCOL.md), which is what makes them comparable at all.
+//
+// The rule: price off the busiest sibling, unless that is us. Activity is a
+// reasonable proxy for which contract the market moves first, and the
+// "unless that is us" clause matters -- quoting the most active contract and
+// then pricing it off a quieter sibling would import lag rather than remove it,
+// which is the exact mistake this is meant to avoid.
+func (q *quoter) onAnyBBO(m *nats.Msg) {
+	f := strings.Fields(string(m.Data))
+	if len(f) < 6 || len(f[1]) < 2 {
+		return
+	}
+	feed := f[1]
+	if !strings.HasPrefix(feed, q.cfg.Feed[:2]) {
+		return // different underlying: unrelated price
+	}
+
+	q.mu.Lock()
+	q.ticks[feed]++
+	best, bestN := "", q.ticks[q.cfg.Feed]
+	for cand, n := range q.ticks {
+		if cand != q.cfg.Feed && n > bestN {
+			best, bestN = cand, n
+		}
+	}
+	changed := best != q.refFeed
+	q.refFeed = best
+	if changed {
+		q.basisSet, q.refOK = false, false // relearn against the new lead
+	}
+	lead := q.refFeed
+	q.mu.Unlock()
+
+	if lead != "" && feed == lead {
+		q.onRefBBO(m)
+	}
+}
+
+// onRefBBO tracks the leading instrument and the basis between it and ours.
+//
+// The basis is learned rather than assumed: we only know the two contracts are
+// related, not by how much. It must adapt *slowly* (BasisAlpha small) -- it stands
+// for the structural offset between the contracts, not the transient lag we are
+// trying to trade. Learn it quickly and it absorbs the lead's move on the very
+// tick we wanted to react to, and the signal vanishes. Slow adaptation also makes
+// this safe if the two are unrelated: the basis converges on whatever difference
+// exists and we end up quoting around our own mid.
+func (q *quoter) onRefBBO(m *nats.Msg) {
+	f := strings.Fields(string(m.Data))
+	if len(f) < 6 {
+		return
+	}
+	bid, bok := parsePx(f[2])
+	ask, aok := parsePx(f[4])
+	if !bok || !aok || ask <= bid {
+		return
+	}
+	rm := float64(bid+ask) / 2
+
+	q.mu.Lock()
+	q.refMid, q.refOK, q.refAt = rm, true, time.Now()
+	if q.bidOK && q.askOK {
+		obs := float64(q.bidPx+q.askPx)/2 - rm
+		if !q.basisSet {
+			q.basis, q.basisSet = obs, true
+		} else {
+			a := q.cfg.BasisAlpha
+			q.basis = a*obs + (1-a)*q.basis
+		}
+	}
+	q.mu.Unlock()
+
+	q.signal() // the lead moved: our fair value has moved with it
+}
+
+// fairValue is what we price around. Caller must hold q.mu.
+//
+// Preference is the reference instrument plus the learned basis, because it moves
+// first; our own mid is the fallback. In the sample market the back months are
+// quoted at `front_fair + offset` by everyone else (sim/market.py:167), so a
+// quoter pricing off its own stale book is repriced last and picked off first.
+func (q *quoter) fairValue() float64 {
+	own := float64(q.bidPx+q.askPx) / 2
+	if !q.cfg.UseRef || !q.refOK || !q.basisSet {
+		return own
+	}
+	if q.refFeed == "" {
+		return own // we are the most active contract: we are the lead
+	}
+	if time.Since(q.refAt) > q.cfg.RefStale {
+		return own // the lead went quiet; trust what we can see
+	}
+	return q.refMid + q.basis
 }
 
 func parsePx(s string) (int, bool) {
@@ -191,7 +310,7 @@ func (q *quoter) applyFill(side byte, vol, px int, id string) {
 	q.lastMark, q.haveMark = float64(px), true // a real trade is a valid mark
 	// Decrement the resting order this filled against. F orders fill partially
 	// and so do resting limits, so a fill does not mean the order is gone.
-	for _, r := range []*resting{&q.bid, &q.ask} {
+	for _, r := range q.live() {
 		if r.id == id {
 			r.vol -= vol
 			if r.vol <= 0 {
@@ -205,7 +324,7 @@ func (q *quoter) applyFill(side byte, vol, px int, id string) {
 func (q *quoter) forget(id string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for _, r := range []*resting{&q.bid, &q.ask} {
+	for _, r := range q.live() {
 		if r.id == id {
 			*r = resting{}
 		}
@@ -294,22 +413,40 @@ func (q *quoter) edge() float64 {
 	return e
 }
 
+// live returns pointers to every resting slot, both sides, all tiers.
+// Caller must hold q.mu.
+func (q *quoter) live() []*resting {
+	out := make([]*resting, 0, len(q.bids)+len(q.asks))
+	for i := range q.bids {
+		out = append(out, &q.bids[i])
+	}
+	for i := range q.asks {
+		out = append(out, &q.asks[i])
+	}
+	return out
+}
+
 // target is the quote we want on one side; vol == 0 means "do not quote".
 type target struct {
 	px  int
 	vol int
 }
 
-// desired computes both sides from the current book and our inventory.
-func (q *quoter) desired() (bid, ask target, ok bool) {
+// desired computes every tier on both sides from the book and our inventory.
+//
+// With two tiers the inner one is tighter and smaller: a single wide quote is
+// safe against sweeps but forfeits all the calm-market flow, and fill counts fell
+// to a few dozen per run because of it. The inner quote earns that flow while
+// risking little; the outer keeps the size where a sweep cannot reach it cheaply.
+func (q *quoter) desired() (bids, asks []target, ok bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if !q.bidOK || !q.askOK || q.askPx <= q.bidPx {
-		return target{}, target{}, false // one-sided or crossed: no fair value
+		return nil, nil, false // one-sided or crossed: no fair value
 	}
 
-	fair := float64(q.bidPx+q.askPx) / 2
+	fair := q.fairValue()
 	edge := q.edge()
 	// Inventory skew: push both quotes away from the position we are carrying, so
 	// the side that flattens us is the attractive one. This is what makes it a
@@ -323,43 +460,81 @@ func (q *quoter) desired() (bid, ask target, ok bool) {
 	// its own inventory -- pushing the work onto the hedger, which pays the spread
 	// to do what skew does for free.
 	skew := q.cfg.SkewFrac * edge * float64(q.position) / float64(q.cfg.MaxPos)
-	bid.px = int(math.Round(fair - edge - skew))
-	ask.px = int(math.Round(fair + edge - skew))
 
-	// Minimum-edge floor. Skew is allowed to make the side that flattens us more
-	// attractive, but never past the point where the fill stops being profitable.
-	// At SkewFrac=1.0 and full inventory the lean is a whole edge, which puts the
-	// flattening side exactly on fair -- this floor is what holds it off. Paying to
-	// reduce inventory is the hedger's job, and it can do it in one trade instead
-	// of waiting for someone to come to us.
-	//
-	// Only the attractive side is floored. The discouraging side stays unbounded --
-	// quoting stingier than fair is always safe.
-	if cap := int(math.Floor(fair - q.cfg.MinEdgeTicks)); bid.px > cap {
-		bid.px = cap
-	}
-	if floor := int(math.Ceil(fair + q.cfg.MinEdgeTicks)); ask.px < floor {
-		ask.px = floor
-	}
+	// Remaining room before the position limit, shared across tiers: the inner
+	// quote is filled first, so it gets first call on the capacity.
+	buyRoom := q.cfg.MaxPos - q.position
+	sellRoom := q.cfg.MaxPos + q.position
 
-	// Never quote a size that could take us through the position limit.
-	bid.vol = clamp(q.cfg.Clip, 0, q.cfg.MaxPos-q.position)
-	ask.vol = clamp(q.cfg.Clip, 0, q.cfg.MaxPos+q.position)
+	bids = make([]target, len(q.bids))
+	asks = make([]target, len(q.asks))
+	for i := range bids {
+		eFrac, sFrac := 1.0, 1.0
+		if len(bids) > 1 && i == 0 {
+			eFrac, sFrac = q.cfg.InnerEdgeFrac, q.cfg.InnerSizeFrac
+		}
+		e := edge * eFrac
+		b := target{px: int(math.Round(fair - e - skew))}
+		a := target{px: int(math.Round(fair + e - skew))}
 
-	// Stay passive: a limit order that crosses executes immediately, which would
-	// make us the aggressor and pay the spread we are trying to earn. With a
-	// positive MinEdgeTicks the floor above already guarantees this (our bid sits
-	// below fair, which sits below the best ask), so this is a guard rather than a
-	// reprice -- if it ever fires, sitting the side out is right, since any price
-	// that satisfies it would breach the minimum edge. Applied last so it is not
-	// undone by the sizing above.
-	if bid.px >= q.askPx {
-		bid.vol = 0
+		// Minimum-edge floor. Skew is allowed to make the side that flattens us
+		// more attractive, but never past the point where the fill stops being
+		// profitable. Paying to reduce inventory is the hedger's job.
+		//
+		// Only the attractive side is floored. The discouraging side stays
+		// unbounded -- quoting stingier than fair is always safe.
+		if cap := int(math.Floor(fair - q.cfg.MinEdgeTicks)); b.px > cap {
+			b.px = cap
+		}
+		if floor := int(math.Ceil(fair + q.cfg.MinEdgeTicks)); a.px < floor {
+			a.px = floor
+		}
+
+		// Prices must sit on the instrument's tick grid, rounding always away
+		// from fair -- bid down, ask up -- so the minimum edge survives it.
+		// Untested against a live tick>1 book: the local exchange lists only
+		// tick=1, so this path rests on EX_META and the reject probe alone.
+		if t := q.cfg.TickSize; t > 1 {
+			b.px = floorToTick(b.px, t)
+			a.px = ceilToTick(a.px, t)
+		}
+
+		size := int(math.Round(float64(q.cfg.Clip) * sFrac))
+		b.vol = clamp(size, 0, buyRoom)
+		a.vol = clamp(size, 0, sellRoom)
+		buyRoom -= b.vol
+		sellRoom -= a.vol
+
+		// Stay passive: a limit that crosses executes immediately, making us the
+		// aggressor and paying the spread we are trying to earn.
+		if b.px >= q.askPx {
+			b.vol = 0
+		}
+		if a.px <= q.bidPx {
+			a.vol = 0
+		}
+		bids[i], asks[i] = b, a
 	}
-	if ask.px <= q.bidPx {
-		ask.vol = 0
+	return bids, asks, true
+}
+
+// floorToTick snaps a price down to the grid; negative prices are legal here
+// (probed: the band is ref +/- band, and bids below zero are accepted), so this
+// floors mathematically rather than truncating toward zero.
+func floorToTick(px, tick int) int {
+	m := px % tick
+	if m < 0 {
+		m += tick
 	}
-	return bid, ask, true
+	return px - m
+}
+
+func ceilToTick(px, tick int) int {
+	f := floorToTick(px, tick)
+	if f == px {
+		return px
+	}
+	return f + tick
 }
 
 func clamp(v, lo, hi int) int {
@@ -397,13 +572,15 @@ func (q *quoter) requote() {
 	q.quoteMu.Lock()
 	defer q.quoteMu.Unlock()
 
-	bid, ask, ok := q.desired()
+	bids, asks, ok := q.desired()
 	if !ok {
 		q.cancelAll()
 		return
 	}
-	q.reconcile(&q.bid, bid, 'B')
-	q.reconcile(&q.ask, ask, 'S')
+	for i := range bids {
+		q.reconcile(&q.bids[i], bids[i], 'B')
+		q.reconcile(&q.asks[i], asks[i], 'S')
+	}
 }
 
 // reconcile brings one side to its target, leaving an already-correct order
@@ -445,7 +622,10 @@ func (q *quoter) reconcile(cur *resting, want target, side byte) {
 }
 
 func (q *quoter) cancelAll() {
-	for _, r := range []*resting{&q.bid, &q.ask} {
+	q.mu.Lock()
+	all := q.live()
+	q.mu.Unlock()
+	for _, r := range all {
 		q.mu.Lock()
 		cur := *r
 		q.mu.Unlock()
@@ -494,6 +674,25 @@ func (q *quoter) markPrice() (px float64, fresh, ok bool) {
 	return 0, false, false
 }
 
+// liqPrice values inventory at what it would actually fetch if closed right now:
+// a long sells into the bid, a short buys from the ask. markPrice uses the mid,
+// which is the fair value of the position but not what you would receive for it.
+// The session ends by liquidating whatever is left against the book, so this is
+// the number that survives contact with the close. Caller must hold q.mu.
+func (q *quoter) liqPrice() (float64, bool) {
+	switch {
+	case q.position > 0 && q.bidOK:
+		return float64(q.bidPx), true
+	case q.position < 0 && q.askOK:
+		return float64(q.askPx), true
+	case q.position == 0:
+		return 0, true // nothing to liquidate
+	case q.haveMark:
+		return q.lastMark, true // no book to hit; the best guess we have
+	}
+	return 0, false
+}
+
 func (q *quoter) status() string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -509,8 +708,29 @@ func (q *quoter) status() string {
 			pnl += "?" // valued against a stale price -- flagged, not hidden
 		}
 	}
-	return fmt.Sprintf("pos=%d cash=%d pnl=%s fills=%d bid=%s ask=%s",
-		q.position, q.cash, pnl, q.fills, fmtQuote(q.bid), fmtQuote(q.ask))
+	liq := "n/a"
+	if px, lok := q.liqPrice(); lok {
+		liq = fmt.Sprintf("%.0f", float64(q.cash)+float64(q.position)*px)
+	}
+	return fmt.Sprintf("pos=%d cash=%d pnl=%s liq=%s fills=%d bid=%s ask=%s",
+		q.position, q.cash, pnl, liq, q.fills, fmtQuote(best(q.bids, true)),
+		fmtQuote(best(q.asks, false)))
+}
+
+// best returns the tightest live quote on a side: the highest bid, the lowest
+// ask. That is the price we are actually showing the market, which is what the
+// status line and the benchmark harness care about.
+func best(rs []resting, highest bool) resting {
+	var out resting
+	for _, r := range rs {
+		if !r.live() {
+			continue
+		}
+		if !out.live() || (highest && r.px > out.px) || (!highest && r.px < out.px) {
+			out = r
+		}
+	}
+	return out
 }
 
 func fmtQuote(r resting) string {
