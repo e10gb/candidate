@@ -17,18 +17,34 @@
 #    point of this script.
 #  * PnL is the liquidation-marked figure (`liq`), i.e. after closing the
 #    position against the book -- the number the session actually ends on.
+#  * Risk is pooled across every repeat and reported as *quantiles*, not as a
+#    maximum. The max of N samples grows with N, so a max measured over 240s is
+#    not comparable with one over 120s -- which is exactly why my quoted risk
+#    figures kept moving. Quantiles and time-above-threshold do not have that
+#    problem.
+#
+# `--full` adds the taker, giving the whole desk: use it for risk, where the
+# taker's exposure counts, and omit it for PnL, where its variance drowns the
+# signal.
+#
+# NOTE: this runs the seats directly, so they take their *code* defaults, not the
+# layout in docker-compose.yml. To measure what actually ships, pass it:
+#   tools/campaign.sh --full -r 3 -d 240 \
+#     QUOTER_FEED=AAM6 HEDGER_FEED=AAH6 QUOTER_MAX_EDGE=40
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 DURATION=240
 REPEATS=3
 LABEL=""
+FULL=0
 ENVS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -d) DURATION="$2"; shift 2 ;;
     -r) REPEATS="$2"; shift 2 ;;
     -n) LABEL="$2"; shift 2 ;;
+    --full) FULL=1; shift ;;
     *=*) ENVS+=("$1"); shift ;;
     *) echo "usage: $0 [-d SECS] [-r REPEATS] [-n LABEL] [KEY=VAL ...]" >&2; exit 2 ;;
   esac
@@ -37,12 +53,24 @@ done
 [ -n "$LABEL" ] || LABEL="defaults"
 
 log() { printf '[campaign] %s\n' "$*" >&2; }
+
+# One campaign at a time. Two of these share one compose project and one set of
+# container names, so running them concurrently silently invalidates both -- it
+# happened: an interrupted campaign kept running in the background and its taker
+# container got read as the new campaign's. mkdir is atomic, so it is the lock.
+LOCK=/tmp/desk-campaign.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "another campaign appears to be running (rm -rf $LOCK if it is stale)" >&2
+  exit 1
+fi
 DC=(docker compose --profile sim)
 NET=""
 results=()
 
 docker build -q -t campaign-quoter ./strategy >/dev/null || exit 1
 docker build -q -t campaign-hedger ./hedger   >/dev/null || exit 1
+[ "$FULL" = 1 ] && { docker build -q -t campaign-taker ./taker >/dev/null || exit 1; }
+pool="$(mktemp)"; trap 'rm -f "$pool"; rmdir "$LOCK" 2>/dev/null' EXIT
 
 for r in $(seq 1 "$REPEATS"); do
   log "run $r/$REPEATS: $LABEL (${DURATION}s)"
@@ -65,9 +93,17 @@ for r in $(seq 1 "$REPEATS"); do
   docker run -d --rm --name camp-h --network "$NET" -e NATS_URL=nats://nats:4222 \
     -e HEDGER_SENDER=HEDGE001 -e SENDER=QUOTE001 ${envargs[@]+"${envargs[@]}"} campaign-hedger >/dev/null
 
+  if [ "$FULL" = 1 ]; then
+    docker run -d --rm --name camp-t --network "$NET" -e NATS_URL=nats://nats:4222 \
+      -e TAKER_SENDER=PYTKR001 -e TAKER_FEED=AAH6 -e TAKER_RUN=86400 \
+      ${envargs[@]+"${envargs[@]}"} campaign-taker >/dev/null
+  fi
+
   sleep "$DURATION"
   q=$(docker logs camp-q 2>&1 | tail -400)
-  docker stop camp-q camp-h >/dev/null 2>&1
+  # held(): the position actually at the exchange, not the hedger's bridged view.
+  docker logs camp-h 2>&1 | grep -o 'held=[-0-9]*' | cut -d= -f2 >> "$pool"
+  docker stop camp-q camp-h camp-t >/dev/null 2>&1
   docker compose --profile sim --profile strategy down --remove-orphans >/dev/null 2>&1
 
   liq=$(printf '%s\n' "$q" | grep -o 'liq=[-0-9]*' | tail -1 | cut -d= -f2)
@@ -80,7 +116,9 @@ for r in $(seq 1 "$REPEATS"); do
 done
 
 printf '\n================ %s ================\n' "$LABEL"
-printf 'runs: %s x %ss (quoter + hedger, no taker)\n' "$REPEATS" "$DURATION"
+seats="quoter + hedger, no taker"
+[ "$FULL" = 1 ] && seats="full desk incl. taker"
+printf 'runs: %s x %ss (%s)\n' "$REPEATS" "$DURATION" "$seats"
 printf 'quoter PnL (closed out): %s\n' "${results[*]}"
 printf '%s\n' "${results[@]}" | awk '
   {n++; s+=$1; a[n]=$1; if(n==1||$1<mn)mn=$1; if(n==1||$1>mx)mx=$1}
@@ -92,3 +130,15 @@ printf '%s\n' "${results[@]}" | awk '
        if (sd>0 && (m<0?-m:m) < sd) print "VERDICT: indistinguishable from zero at this sample size"
        else if (m>0) print "VERDICT: positive, and larger than the run-to-run spread"
        else print "VERDICT: negative, and larger than the run-to-run spread" }'
+
+printf '\ndesk exposure, pooled over every repeat (held at the exchange):\n'
+sort -n "$pool" | awk '
+  {v=$1; a[++n]=(v<0?-v:v); s+=a[n]; if(a[n]>=10)o10++; if(a[n]>=25)o25++}
+  END{ if(!n){print "  no samples"; exit}
+       asort=n; for(i=1;i<=n;i++) for(j=i+1;j<=n;j++) if(a[j]<a[i]){t=a[i];a[i]=a[j];a[j]=t}
+       printf "  samples %d   mean %.2f   p50 %d   p95 %d   p99 %d   max %d\n",
+              n, s/n, a[int(n*0.50)+1], a[int(n*0.95)], a[int(n*0.99)], a[n]
+       printf "  time at/over 10 lots: %.1f%%   at/over 25: %.1f%%\n",
+              100*o10/n, 100*o25/n
+       print  "  (quantiles, not the max: the max of N samples grows with N and is"
+       print  "   therefore not comparable between runs of different length)" }'

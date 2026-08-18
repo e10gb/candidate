@@ -69,7 +69,9 @@ qlots=$(grep -oE '^\[?[^ ]*\]? *[0-9:.]* *fill [BS] [0-9]+' "$Q" |
         awk '{v+=$NF} END{print v+0}')
 tlots=$(grep -c 'fill' "$T" 2>/dev/null || echo 0)
 
-read -r dmax dmean dover <<<"$(grep -o 'desk=[-0-9]*' "$H" | cut -d= -f2 | awk '
+# held(), not the hedger's bridged desk view: the bridge is an estimate and
+# should not flatter the risk figure.
+read -r dmax dmean dover <<<"$(grep -o 'held=[-0-9]*' "$H" | cut -d= -f2 | awk '
   {n++; a=($1<0?-$1:$1); s+=a; if(a>mx)mx=a; if(a>=25)o++}
   END{ if(!n){print "- - -"; exit} printf "%d %.2f %.0f", mx, s/n, 100*o/n }')"
 

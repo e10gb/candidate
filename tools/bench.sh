@@ -57,7 +57,10 @@ trap 'rm -rf "$tmp"' EXIT
 
 # Risk: the distribution of desk exposure, not just its endpoint. A desk that
 # averages zero by oscillating between -40 and +40 is not flat.
-risk="$(grep -o 'desk=[-0-9]*' "$tmp/h.log" | cut -d= -f2 | awk -v d="$DURATION" '
+# Risk is measured on held(), the position actually at the exchange, not on
+# the hedger's bridged desk view -- the bridge is an estimate and must not
+# flatter the number it is being judged by.
+risk="$(grep -o 'held=[-0-9]*' "$tmp/h.log" | cut -d= -f2 | awk -v d="$DURATION" '
   {n++; a=($1<0?-$1:$1); s+=a; if(a>mx)mx=a; if(a>=10)o10++; if(a>=25)o25++}
   END{ if(!n){print "no-data"; exit}
        printf "%d %.2f %.0f %.0f", mx, s/n, 100*o10/n, 100*o25/n }')"
