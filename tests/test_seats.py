@@ -59,21 +59,60 @@ class HedgerPositions(unittest.TestCase):
         self.h.positions["quoter"] = -10
         self.h.positions["taker"] = 4
         self.h.inflight = 3
+        self.h.inflight_at = time.monotonic()   # freshly fired, as cross() sets it
         self.assertEqual(self.h.desk(), -3)
 
     def test_inflight_retires_by_signed_amount(self):
         """The bug: retiring by magnitude toward zero corrupted the count as soon
         as hedges in both directions were outstanding. Desk exposure hit 55."""
-        self.h.inflight = -25                      # a sell hedge is outstanding
+        self.h.inflight, self.h.inflight_at = -25, time.monotonic()
         self.feed("hedger", self.me, f"1 T {self.me}:bbbbbbbb O:aaaaaaaa 25 650 1 S")
         self.assertEqual(self.h.positions["hedger"], -25)
         self.assertEqual(self.h.inflight, 0, "confirmed fill should clear in-flight")
 
     def test_inflight_with_opposite_hedges_outstanding(self):
-        self.h.inflight = 10                       # a buy hedge outstanding
+        self.h.inflight, self.h.inflight_at = 10, time.monotonic()
         self.feed("hedger", self.me, f"1 T {self.me}:bbbbbbbb O:aaaaaaaa 10 650 1 B")
         self.assertEqual(self.h.inflight, 0)
         self.assertEqual(self.h.desk(), 10, "position confirmed, no longer in flight")
+
+    def test_passive_fill_does_not_retire_phantom_inflight(self):
+        """cross() puts volume on the in-flight bridge; rest() does not. Retiring
+        a passive fill cancelled the hedger's own position out of desk(), so the
+        desk reported flat while carrying real exposure."""
+        self.h.inflight = 0
+        # A passive sell: we were the resting side, a buyer aggressed.
+        self.feed("hedger", self.me, f"1 E OTHER001:aaaaaaaa {self.me}:bbbbbbbb 20 650 1 B")
+        self.assertEqual(self.h.positions["hedger"], -20)
+        self.assertEqual(self.h.inflight, 0, "a passive fill was never in flight")
+        self.assertEqual(self.h.desk(), -20, "exposure must be visible, not cancelled")
+
+    def test_aggressive_fill_retires_inflight(self):
+        self.h.inflight = -25
+        self.feed("hedger", self.me, f"1 T {self.me}:bbbbbbbb O:aaaaaaaa 25 650 1 S")
+        self.assertEqual(self.h.inflight, 0)
+        self.assertEqual(self.h.desk(), -25)
+
+    def test_inflight_never_flips_sign(self):
+        """A limit order that crossed on entry was never counted as in flight;
+        retiring it must not push the bridge past zero into the other direction."""
+        self.h.inflight, self.h.inflight_at = 5, time.monotonic()
+        self.feed("hedger", self.me, f"1 T {self.me}:bbbbbbbb O:aaaaaaaa 30 650 1 B")
+        self.assertEqual(self.h.inflight, 0)
+
+    def test_stale_inflight_is_dropped(self):
+        """The bridge covers a millisecond round trip. If a confirmation never
+        arrives -- e.g. the hedger crossed into its own resting order, which is
+        no position change and so produces no bookable fill -- it must expire
+        rather than hide real exposure indefinitely."""
+        self.h.positions["quoter"] = -12
+        self.h.inflight = 12
+        self.h.inflight_at = time.monotonic()
+        self.assertEqual(self.h.desk(), 0, "fresh in-flight still bridges the gap")
+
+        self.h.inflight_at = time.monotonic() - (hedger.INFLIGHT_TTL + 0.5)
+        self.assertEqual(self.h.desk(), -12, "stale in-flight must be dropped")
+        self.assertEqual(self.h.inflight, 0)
 
     def test_pnl_never_values_a_live_position_at_zero(self):
         self.h.positions["hedger"] = 10
@@ -163,6 +202,35 @@ class HedgerPassiveFirst(unittest.TestCase):
         px = int(self.sent[0].split()[6])
         self.assertLess(px, self.h.best_ask,
                         "improving on a one-tick book must not cross the offer")
+
+
+class TakerOrderIds(unittest.TestCase):
+    """Ids are consumed permanently per sender, and `restart: on-failure` makes
+    restarts routine, so they must never repeat across one either."""
+
+    def test_ids_are_eight_chars_and_unique(self):
+        t = taker.Taker(nc=None)
+        seen = set()
+        for _ in range(20000):
+            oid = t.next_oid()
+            self.assertEqual(len(oid), 8, f"{oid!r} is not 8 characters")
+            self.assertNotIn(oid, seen)
+            seen.add(oid)
+
+    def test_a_restart_resumes_above_the_previous_run(self):
+        """Clock-seeding puts a restart above where the last run *started*, so it
+        clears where that run *ended* only while ids are consumed more slowly than
+        the clock advances -- under 1000/sec. The seats run at 2-30/sec, so the
+        headroom is ~30x. This asserts the real property: after a gap far shorter
+        than any container restart, a fresh seat is already past the old one."""
+        first = taker.Taker(nc=None)
+        for _ in range(50):          # 50 ids costs the clock ~0ms
+            first.next_oid()
+        highest = first.next_oid()
+        time.sleep(0.06)             # a restart takes seconds; 60ms is pessimistic
+        restarted = taker.Taker(nc=None)
+        self.assertGreater(restarted.next_oid(), highest,
+                           "a restart must not re-issue ids the last run burned")
 
 
 class HedgerMeta(unittest.TestCase):

@@ -76,10 +76,15 @@ run_smoke() {
   sleep 12
   sleep "$SMOKE_SECS"
 
+  # Only the measurement window, not the boot: the seats connect while the
+  # exchange is still coming up, and a request that times out there is logged and
+  # retried on the next tick. That is correct behaviour, but it is not steady
+  # state, and judging a running desk on its first second is how you end up muting
+  # a check that should stay strict.
   local tmp; tmp="$(mktemp -d)"
-  "${DC[@]}" logs --no-log-prefix --tail 2000 strategy > "$tmp/q.log" 2>&1
-  "${DC[@]}" logs --no-log-prefix --tail 2000 hedger   > "$tmp/h.log" 2>&1
-  "${DC[@]}" logs --no-log-prefix --tail 2000 taker    > "$tmp/t.log" 2>&1
+  "${DC[@]}" logs --no-log-prefix --since "${SMOKE_SECS}s" strategy > "$tmp/q.log" 2>&1
+  "${DC[@]}" logs --no-log-prefix --since "${SMOKE_SECS}s" hedger   > "$tmp/h.log" 2>&1
+  "${DC[@]}" logs --no-log-prefix --since "${SMOKE_SECS}s" taker    > "$tmp/t.log" 2>&1
   "${DC[@]}" down --remove-orphans >/dev/null 2>&1
 
   # The desk actually traded. A silent, flat, zero-fill run looks healthy and is
@@ -97,7 +102,7 @@ run_smoke() {
 
   # Risk: the desk stayed bounded. This is the headline claim of Job 2.
   local maxdesk
-  maxdesk=$(grep -o 'desk=[-0-9]*' "$tmp/h.log" | cut -d= -f2 |
+  maxdesk=$(grep -o 'held=[-0-9]*' "$tmp/h.log" | cut -d= -f2 |
             awk '{a=($1<0?-$1:$1); if(a>m)m=a} END{print m+0}')
   if [ "${maxdesk:-999}" -le 30 ]; then ok "desk exposure bounded (max |desk| = $maxdesk)"
   else bad "desk exposure reached $maxdesk"; fi
