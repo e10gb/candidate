@@ -69,6 +69,8 @@ services:
       HEDGE_THRESH: ${HEDGE_THRESH:-}
       HEDGE_CLIP: ${HEDGE_CLIP:-}
       HEDGE_SLIP: ${HEDGE_SLIP:-}
+      HEDGE_URGENT: ${HEDGE_URGENT:-}
+      HEDGE_PASSIVE_MS: ${HEDGE_PASSIVE_MS:-}
     depends_on:
       - exchange
     restart: on-failure

@@ -89,6 +89,12 @@ read -r qposmean qposmax <<<"$qpos"
 pnl_of() { grep -o 'pnl=[-0-9]*' "$1" | tail -1 | cut -d= -f2; }
 qp="$(pnl_of "$tmp/q.log")"; tp="$(pnl_of "$tmp/t.log")"; hp="$(pnl_of "$tmp/h.log")"
 churn="$(grep -o 'traded=[0-9]*' "$tmp/h.log" | tail -1 | cut -d= -f2)"
+# What hedging actually costs, in price units per lot away from the mid at the
+# moment of the fill. Mechanical rather than path-dependent, so unlike PnL it is
+# comparable across short runs.
+hcost="$(grep -o 'cost/lot=[-0-9.]*' "$tmp/h.log" | tail -1 | cut -d= -f2)"
+hpass="$(grep -o 'passive=[0-9]*' "$tmp/h.log" | tail -1 | cut -d= -f2)"
+hcross="$(grep -o 'crossed=[0-9]*' "$tmp/h.log" | tail -1 | cut -d= -f2)"
 
 read -r mx mean o10 o25 <<<"$risk"
 total=$(( ${qp:-0} + ${tp:-0} + ${hp:-0} ))
@@ -101,11 +107,15 @@ printf 'QUOTE spread   : median %-5s mean %-5s max %-5s  quoter fills: %s\n' \
 printf 'QUOTER invtry  : mean |pos| %-6s max |pos| %s\n' "$qposmean" "$qposmax"
 printf 'PNL   quoter   : %-8s taker: %-8s hedger: %-8s\n' "${qp:-n/a}" "${tp:-n/a}" "${hp:-n/a}"
 printf 'PNL   TOTAL    : %-8s   (hedger lots traded: %s)\n' "$total" "${churn:-0}"
+printf 'HEDGE cost/lot : %-7s passive lots: %-6s crossed lots: %s\n' \
+  "${hcost:--}" "${hpass:--}" "${hcross:--}"
 printf '%s\n' "----------------------------------------------------------------"
 
 # Machine-readable, for collecting a sweep into one table.
 # label,secs,max,mean,pct>=10,pct>=25,quoter,taker,hedger,total,hedger_lots,
-# spread_median,spread_mean,spread_max,quoter_fills,qpos_mean,qpos_max
-printf 'CSV,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+# spread_median,spread_mean,spread_max,quoter_fills,qpos_mean,qpos_max,
+# hedge_cost_per_lot,passive_lots,crossed_lots
+printf 'CSV,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
   "$LABEL" "$DURATION" "$mx" "$mean" "$o10" "$o25" "${qp:-}" "${tp:-}" "${hp:-}" "$total" \
-  "${churn:-0}" "$spmed" "$spmean" "$spmax" "${qfills:-0}" "$qposmean" "$qposmax"
+  "${churn:-0}" "$spmed" "$spmean" "$spmax" "${qfills:-0}" "$qposmean" "$qposmax" \
+  "${hcost:-}" "${hpass:-0}" "${hcross:-0}"

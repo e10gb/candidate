@@ -2,9 +2,11 @@
 """Desk hedger.
 
 Keeps the desk's *combined* position -- quoter + taker + hedger -- near zero.
-When the other seats accumulate exposure, this reduces it by crossing the spread.
-It is the seat that is allowed to pay for speed: a small position held for a while
-is cheap, a large one held for a second is not.
+When the other seats accumulate exposure, this reduces it. It is the seat that is
+allowed to pay for speed -- a small position held for a while is cheap, a large one
+held for a second is not -- but it only pays when it has to: modest exposure is
+first worked passively at the touch, and only crossed if that does not fill in
+HEDGE_PASSIVE_MS or the position grows past HEDGE_URGENT.
 
 Two decisions worth stating up front, both forced by what we found in the exchange
 (see NOTES.md):
@@ -31,6 +33,9 @@ Config (env):
   HEDGE_SLIP       ticks through the touch we will pay   (default 10)
   HEDGE_INTERVAL   seconds between checks                (default 0.05)
   HEDGE_MAX_TPS    self-imposed request rate cap         (default 20)
+  HEDGE_URGENT     exposure at/above which we cross at once (default 15)
+  HEDGE_PASSIVE_MS how long to rest before crossing        (default 300)
+  HEDGE_PASSIVE_IMPROVE  ticks to improve on the touch     (default 1)
 """
 import asyncio
 import os
@@ -65,6 +70,21 @@ CLIP = env("HEDGE_CLIP", 25, int)
 SLIP = env("HEDGE_SLIP", 10, int)
 INTERVAL = env("HEDGE_INTERVAL", 0.05, float)
 MAX_TPS = env("HEDGE_MAX_TPS", 20, int)
+
+# Passive-first hedging. Crossing the spread on every hedge is the desk's largest
+# mechanical cost: measured around 4 price units per lot on ~200 lots per two
+# minutes. Modest exposure does not need that urgency -- TASK.md's own risk model
+# says a small position held for a while is cheap and a large one is not -- so we
+# first rest an order at the touch and only cross if it has not filled.
+#
+# URGENT is the size above which we stop being patient and take the spread hit
+# immediately. Below it, patience costs a little time and saves the spread.
+URGENT = env("HEDGE_URGENT", 15, int)
+PASSIVE_MS = env("HEDGE_PASSIVE_MS", 300, int)
+# Ticks to improve on the touch when resting. 0 joins the back of the queue and
+# rarely fills in the time available; 1 puts us at the front and still buys below
+# the offer, so it remains far cheaper than crossing.
+PASSIVE_IMPROVE = env("HEDGE_PASSIVE_IMPROVE", 1, int)
 
 BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -101,6 +121,17 @@ class Hedger:
         self.cash = 0
         self.last_mark = None   # last price we can value inventory against
         self.last_send = 0.0
+        # A resting hedge order, if we are currently being patient:
+        # {"id":..., "side":..., "at": monotonic}
+        self.passive = None
+        self.passive_lots = 0
+        self.crossed_lots = 0
+        # Cost of hedging, measured directly: how far from the mid each fill was,
+        # signed so that paying up is positive. This is the number passive-first
+        # hedging is meant to reduce, and unlike PnL it is mechanical rather than
+        # path-dependent, so it can be compared across short runs.
+        self.cost_lots = 0
+        self.cost_sum = 0.0
         self.min_gap = 1.0 / MAX_TPS if MAX_TPS > 0 else 0.0
 
     # ---- market data ------------------------------------------------------- #
@@ -145,6 +176,16 @@ class Hedger:
             self.last_mark = float(px)   # any seat's trade is a valid mark
             if seat == "hedger":
                 self.cash -= signed * px
+                # Distance from the mid at the moment we traded, signed so that
+                # paying up to get done is a positive cost.
+                if self.best_bid is not None and self.best_ask is not None:
+                    mid = (self.best_bid + self.best_ask) / 2
+                    self.cost_sum += (px - mid if side == "B" else mid - px) * vol
+                    self.cost_lots += vol
+                if resting_is_ours:
+                    self.passive_lots += vol
+                else:
+                    self.crossed_lots += vol
                 # This fill is confirmed, so retire it from the in-flight bridge.
                 # Must be the *signed* amount: an earlier version decremented by
                 # magnitude toward zero, which corrupted the count as soon as a buy
@@ -173,14 +214,23 @@ class Hedger:
             return None
         return reply.data.decode().split()
 
-    async def hedge(self):
-        exposure = self.desk()
-        if abs(exposure) < THRESH:
-            return
-        # Long the desk -> sell. Short -> buy.
+    async def cancel(self, oid):
+        parts = await self.request(f"{SENDER} C {FEED} {oid}")
+        # 206 (never used) and 305 (used but no longer resting) both mean the order
+        # is not on the book, which is the state we wanted.
+        if parts and len(parts) >= 3 and parts[1] == "N" and parts[2] not in ("206", "305"):
+            print(f"[hedger] cancel rejected {parts[2]}", flush=True)
+
+    async def drop_passive(self):
+        if self.passive:
+            await self.cancel(self.passive["id"])
+            self.passive = None
+
+    async def cross(self, exposure):
+        """Take the spread to get flat now. Used when exposure is urgent, or when
+        patience has already been tried and did not work."""
         side = "S" if exposure > 0 else "B"
         size = min(abs(exposure), CLIP)
-
         # Price is a slippage limit, not the expected fill price: the exchange
         # matches against resting orders at *their* prices, so this sweeps the book
         # from the touch and refuses to pay more than SLIP ticks through it.
@@ -194,15 +244,14 @@ class Hedger:
             price = self.best_ask + SLIP
 
         self.oid += 1
-        order = f"{SENDER} A {FEED} {base36(self.oid)} {side} {size} {price} F"
-        parts = await self.request(order)
+        parts = await self.request(
+            f"{SENDER} A {FEED} {base36(self.oid)} {side} {size} {price} F")
         if not parts or len(parts) < 2:
             return
         if parts[1] != "Y":
             code = parts[2] if len(parts) > 2 else "?"
             print(f"[hedger] rejected {code}: {' '.join(parts[3:])}", flush=True)
             return
-
         # F fills partially. The reply's count is what actually traded; whatever is
         # left over stays on the books and gets re-hedged on the next tick.
         filled = int(parts[2]) if len(parts) > 2 else 0
@@ -210,8 +259,58 @@ class Hedger:
             self.inflight += filled if side == "B" else -filled
             self.hedges += 1
             self.traded += filled
-            print(f"[hedger] {side} {filled}/{size} @<={price} "
+            print(f"[hedger] cross {side} {filled}/{size} @<={price} "
                   f"desk {exposure} -> {self.desk()}", flush=True)
+
+    async def rest(self, exposure):
+        """Try to get flat without paying the spread, by resting at the touch."""
+        side = "S" if exposure > 0 else "B"
+        size = min(abs(exposure), CLIP)
+        if self.best_bid is None or self.best_ask is None:
+            return
+        if side == "B":
+            price = self.best_bid + PASSIVE_IMPROVE
+            if price >= self.best_ask:      # improving would cross: just join
+                price = self.best_bid
+        else:
+            price = self.best_ask - PASSIVE_IMPROVE
+            if price <= self.best_bid:
+                price = self.best_ask
+
+        self.oid += 1
+        oid = base36(self.oid)
+        parts = await self.request(f"{SENDER} A {FEED} {oid} {side} {size} {price} L")
+        if not parts or len(parts) < 2 or parts[1] != "Y":
+            if parts and len(parts) >= 3:
+                print(f"[hedger] passive rejected {parts[2]}", flush=True)
+            return
+        # A limit at the touch normally rests; anything that traded on entry is
+        # reported on our own feed and booked there.
+        self.passive = {"id": oid, "side": side, "at": time.monotonic()}
+
+    async def hedge(self):
+        exposure = self.desk()
+
+        if self.passive:
+            want = "S" if exposure > 0 else "B"
+            waited = (time.monotonic() - self.passive["at"]) * 1000
+            if abs(exposure) < THRESH:
+                await self.drop_passive()          # someone else flattened us
+            elif self.passive["side"] != want:
+                await self.drop_passive()          # exposure flipped sign
+            elif abs(exposure) >= URGENT or waited >= PASSIVE_MS:
+                await self.drop_passive()          # out of patience, or now urgent
+                await self.cross(self.desk())
+            else:
+                pass                               # still waiting; give it time
+            return
+
+        if abs(exposure) < THRESH:
+            return
+        if abs(exposure) >= URGENT:
+            await self.cross(exposure)             # too big to be patient about
+        else:
+            await self.rest(exposure)
 
     async def hedge_loop(self):
         while True:
@@ -251,9 +350,12 @@ class Hedger:
             await asyncio.sleep(1.0)
             pos = " ".join(f"{k}={v}" for k, v in self.positions.items())
             p = self.pnl()
+            cost = (self.cost_sum / self.cost_lots) if self.cost_lots else 0.0
             s = (f"desk={self.desk()} {pos} inflight={self.inflight} "
                  f"hedges={self.hedges} traded={self.traded} cash={self.cash} "
-                 f"pnl={'n/a' if p is None else format(p, '.0f')}")
+                 f"pnl={'n/a' if p is None else format(p, '.0f')} "
+                 f"passive={self.passive_lots} crossed={self.crossed_lots} "
+                 f"cost/lot={cost:.2f}")
             print(f"[hedger] {s}", flush=True)
             await self.nc.publish(f"strat.{SENDER}.status", s.encode())
 

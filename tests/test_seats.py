@@ -87,6 +87,84 @@ class HedgerPositions(unittest.TestCase):
         self.assertIsNone(self.h.pnl(), "unmarkable must be None, not cash")
 
 
+class HedgerPassiveFirst(unittest.TestCase):
+    """The hedger pays the spread only when it has to.
+
+    Crossing every time was the desk's largest mechanical cost (~3-5 price units
+    per lot). Modest exposure is worked passively first; large exposure is still
+    taken immediately, because that is the risk the brief actually cares about.
+    """
+
+    def setUp(self):
+        self.h = hedger.Hedger(nc=None)
+        self.h.best_bid, self.h.best_ask = 600, 610
+        self.sent = []
+
+        async def fake_request(msg):
+            self.sent.append(msg)
+            f = msg.split()
+            if f[1] == "A":
+                # Limit orders rest (nothing traded); F orders fill in full here.
+                return ["EX", "Y", "0" if f[-1] == "L" else f[6]]
+            return ["EX", "Y", "1"]          # cancel
+
+        self.h.request = fake_request
+
+    def kinds(self):
+        return [m.split()[1] + (m.split()[-1] if m.split()[1] == "A" else "")
+                for m in self.sent]
+
+    def test_below_threshold_does_nothing(self):
+        self.h.positions["quoter"] = hedger.THRESH - 1
+        run(self.h.hedge())
+        self.assertEqual(self.sent, [], "small exposure needs no action at all")
+
+    def test_modest_exposure_rests_instead_of_crossing(self):
+        self.h.positions["quoter"] = hedger.THRESH + 1
+        run(self.h.hedge())
+        self.assertEqual(self.kinds(), ["AL"], "should rest a limit, not cross")
+        self.assertIsNotNone(self.h.passive)
+
+    def test_urgent_exposure_crosses_immediately(self):
+        self.h.positions["quoter"] = hedger.URGENT + 5
+        run(self.h.hedge())
+        self.assertEqual(self.kinds(), ["AF"], "large exposure must not wait")
+        self.assertIsNone(self.h.passive)
+
+    def test_patience_runs_out_and_it_crosses(self):
+        self.h.positions["quoter"] = hedger.THRESH + 1
+        run(self.h.hedge())                                   # rests
+        self.h.passive["at"] -= hedger.PASSIVE_MS / 1000 + 1  # pretend time passed
+        run(self.h.hedge())
+        self.assertEqual(self.kinds(), ["AL", "C", "AF"],
+                         "should cancel the resting order, then cross")
+        self.assertIsNone(self.h.passive)
+
+    def test_resting_order_is_pulled_once_the_desk_is_flat(self):
+        self.h.positions["quoter"] = hedger.THRESH + 1
+        run(self.h.hedge())
+        self.h.positions["quoter"] = 0        # another seat flattened us
+        run(self.h.hedge())
+        self.assertEqual(self.kinds(), ["AL", "C"], "stale hedge must be cancelled")
+        self.assertIsNone(self.h.passive)
+
+    def test_resting_order_is_pulled_when_exposure_flips_sign(self):
+        self.h.positions["quoter"] = hedger.THRESH + 1
+        run(self.h.hedge())
+        self.h.positions["quoter"] = -(hedger.THRESH + 1)
+        run(self.h.hedge())
+        self.assertEqual(self.kinds(), ["AL", "C"],
+                         "a sell hedge is wrong once the desk is short")
+
+    def test_passive_price_never_crosses_the_book(self):
+        self.h.best_bid, self.h.best_ask = 600, 601   # one tick wide
+        self.h.positions["quoter"] = -(hedger.THRESH + 1)   # short -> we buy
+        run(self.h.hedge())
+        px = int(self.sent[0].split()[6])
+        self.assertLess(px, self.h.best_ask,
+                        "improving on a one-tick book must not cross the offer")
+
+
 class TakerSignal(unittest.TestCase):
     def setUp(self):
         self.t = taker.Taker(nc=None)
