@@ -58,7 +58,8 @@ position held for a while is cheap, a large one held for a second is not.
 | `HEDGE_CLIP` | `25` | max size per hedge order (clamped by `position_limit`) |
 | `HEDGE_SLIP` | `10` | ticks through the touch we will pay when crossing |
 | `HEDGE_INTERVAL` | `0.05` | seconds between checks |
-| `HEDGE_MAX_TPS` | `20` | request rate cap; lowered if `EX_META` declares tighter |
+| `HEDGE_MAX_TPS` | `20` | request rate cap; lowered if `EX_META` declares tighter. Measured at 3.0 req/sec against it, so it is not binding |
+| `HEDGE_INFLIGHT_TTL` | `1.0` | seconds a fired-but-unconfirmed hedge may keep suppressing further hedging |
 
 ## Reporting
 

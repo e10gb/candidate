@@ -88,6 +88,10 @@ PASSIVE_MS = env("HEDGE_PASSIVE_MS", 300, int)
 # rarely fills in the time available; 1 puts us at the front and still buys below
 # the offer, so it remains far cheaper than crossing.
 PASSIVE_IMPROVE = env("HEDGE_PASSIVE_IMPROVE", 1, int)
+# How long a fired-but-unconfirmed hedge may keep suppressing further hedging.
+# The round trip is milliseconds; a second is generous and bounds how long the
+# desk can misread its own exposure if a confirmation never arrives.
+INFLIGHT_TTL = env("HEDGE_INFLIGHT_TTL", 1.0, float)
 
 BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -158,6 +162,7 @@ class Hedger:
         # feed. Without this the desk looks unhedged for as long as the round trip
         # takes and we fire the same hedge repeatedly.
         self.inflight = 0
+        self.inflight_at = 0.0
         self.best_bid = None
         self.best_ask = None
         self.oid = int(time.time() * 1000)
@@ -233,18 +238,55 @@ class Hedger:
                     self.passive_lots += vol
                 else:
                     self.crossed_lots += vol
-                # This fill is confirmed, so retire it from the in-flight bridge.
-                # Must be the *signed* amount: an earlier version decremented by
-                # magnitude toward zero, which corrupted the count as soon as a buy
-                # hedge and a sell hedge were outstanding in the same direction.
-                self.inflight -= signed
+                # Retire this fill from the in-flight bridge -- but only if it
+                # was ever *on* the bridge. cross() adds to inflight; rest() does
+                # not, because a resting order has not traded. Retiring a passive
+                # fill here cancels the hedger's own position out of desk() and
+                # leaves real exposure invisible: measured desk=-4 while the seats
+                # actually held -44 between them, the desk reporting flat while
+                # carrying forty lots.
+                #
+                # The signed amount matters too: an earlier version retired by
+                # magnitude toward zero, which corrupted the count as soon as buy
+                # and sell hedges were outstanding together.
+                if incoming_is_ours and self.inflight:
+                    left = self.inflight - signed
+                    # A fill larger than what was outstanding, or a limit order
+                    # that crossed on entry and so was never counted, must not
+                    # flip the bridge's sign and start misreporting the other way.
+                    if (self.inflight > 0) != (left > 0):
+                        left = 0
+                    self.inflight = left
+                    self.inflight_at = time.monotonic()
 
         return handler
 
     # ---- hedging ----------------------------------------------------------- #
 
+    def held(self):
+        """Exposure actually held at the exchange, with no in-flight bridging.
+
+        desk() is what the hedger *acts* on -- bridging stops it double-hedging an
+        order already sent. held() is what the desk *is*, and is the honest number
+        for reporting risk: the bridge is an estimate, and an estimate should not
+        flatter the risk figure."""
+        return sum(self.positions.values())
+
     def desk(self):
-        """Desk exposure including anything we have fired but not yet seen back."""
+        """Desk exposure, including anything fired but not yet echoed back.
+
+        The bridge is *self-healing*: it covers a round trip of milliseconds, so
+        anything still outstanding after INFLIGHT_TTL is stale and gets dropped.
+        Without that, any path which adds to inflight without producing a
+        confirming fill -- the hedger crossing into its own resting order is one,
+        since a self-match is no position change and is skipped -- leaves the
+        bridge permanently overstated and the desk blind to real exposure. It
+        reported flat while the seats held 40 lots between them. Positions come
+        from the exchange and are always right; the bridge is the only guess here,
+        so it is the part with an expiry on it."""
+        if self.inflight and time.monotonic() - self.inflight_at > INFLIGHT_TTL:
+            print(f"[hedger] dropping stale in-flight {self.inflight}", flush=True)
+            self.inflight = 0
         return sum(self.positions.values()) + self.inflight
 
     async def request(self, msg):
@@ -304,6 +346,7 @@ class Hedger:
         filled = int(parts[2]) if len(parts) > 2 else 0
         if filled:
             self.inflight += filled if side == "B" else -filled
+            self.inflight_at = time.monotonic()
             self.hedges += 1
             self.traded += filled
             print(f"[hedger] cross {side} {filled}/{size} @<={price} "
@@ -413,7 +456,7 @@ class Hedger:
             pos = " ".join(f"{k}={v}" for k, v in self.positions.items())
             p, l = self.pnl(), self.liq()
             cost = (self.cost_sum / self.cost_lots) if self.cost_lots else 0.0
-            s = (f"desk={self.desk()} {pos} inflight={self.inflight} "
+            s = (f"desk={self.desk()} held={self.held()} {pos} inflight={self.inflight} "
                  f"hedges={self.hedges} traded={self.traded} cash={self.cash} "
                  f"pnl={'n/a' if p is None else format(p, '.0f')} "
                  f"liq={'n/a' if l is None else format(l, '.0f')} "
