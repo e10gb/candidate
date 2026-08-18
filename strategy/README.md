@@ -1,0 +1,81 @@
+# Quoter (Go)
+
+The desk's market-making seat. Rests two-sided liquidity on one contract and earns
+the spread; it takes no directional view. `NOTES.md` in the repo root carries the
+measurements and reasoning behind every choice here, including the ones that were
+tried and rejected.
+
+## How it prices
+
+1. **Fair value.** The mid of the contract it quotes -- unless a *sibling contract
+   is more actively traded*, in which case it prices off that one plus a learned
+   basis. Contracts on the same underlying share a two-character prefix
+   (`PROTOCOL.md`), so the leader is discovered at runtime rather than configured.
+   Pricing off a quieter sibling would import lag, so the rule is "follow the
+   busiest, unless that is us".
+2. **Edge.** `EdgeVolMult x stdev(mid)` over a rolling window, floored at
+   `QUOTER_EDGE` and capped. A spread has to cover how far the price moves while
+   you are holding, and that distance is a property of the market, not a constant:
+   a fixed edge would be this sample market's move size memorised.
+3. **Inventory skew.** Quotes lean against the position, as a fraction of the
+   *current edge* so the lean keeps its strength at any width.
+4. **Minimum-edge floor.** Skew may make the flattening side attractive, never
+   unprofitable. Clearing inventory at a loss is the hedger's job -- it can do it
+   in one trade instead of waiting to be lifted.
+5. **Sizing.** Never quotes a size that could breach the position limit, which is
+   itself clamped to the exchange's declared `position_limit`.
+
+## Things that are deliberate
+
+- **Position comes from the exchange, never from our own requests.** Fills are
+  booked from `ex.md.<FEED>.<SENDER>`, handling both `E` (we rested) and `T` (we
+  crossed) -- they are not duplicates, and handling only one silently loses fills.
+- **Cancel by order id, never `X`.** Cancel-many does not reliably select by side
+  and price (probed; see NOTES.md).
+- **Order ids are never recycled.** They are consumed permanently per sender, so
+  the generator is monotonic and seeded from the clock to survive a restart.
+- **Limits are read, not guessed.** `EX_META` supplies `max_tps`, `ticksize` and
+  `position_limit` at startup. A guessed rate cap risks *disconnection* one way
+  and needless slowness the other.
+- **Rate limiting is a token bucket, not fixed spacing.** Repricing both sides is
+  four requests; forcing them apart left us on stale quotes while well under
+  budget.
+- **Requoting leaves correct orders alone**, preserving queue position, and acts
+  only on genuine top-of-book changes -- the feed republishes constantly.
+
+## Configuration
+
+All optional; defaults in brackets. Empty values are treated as unset.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NATS_URL` | `nats://127.0.0.1:4222` | exchange connection |
+| `SENDER` | `QUOTE001` | our 8-char sender id |
+| `QUOTER_FEED` | `$TAKER_FEED`, else `AAH6` | contract to quote |
+| `QUOTER_CLIP` | `5` | size per quote |
+| `QUOTER_MAX_POS` | `25` | max absolute position (clamped by `position_limit`) |
+| `QUOTER_EDGE` | `2` | floor on the half-spread |
+| `QUOTER_EDGE_VOL` | `4.0` | edge as a multiple of measured volatility; `0` = fixed edge |
+| `QUOTER_MAX_EDGE` | `20` | absolute cap on the edge (compose ships `40`) |
+| `QUOTER_VOL_WINDOW_MS` | `2000` | volatility measurement window |
+| `QUOTER_SKEW_FRAC` | `1.0` | inventory lean at full position, as a fraction of the edge |
+| `QUOTER_MIN_EDGE` | `1` | margin every quote keeps against fair value |
+| `QUOTER_USE_REF` | `1` | price off the busiest sibling contract; `0` disables |
+| `QUOTER_BASIS_ALPHA` | `0.05` | EWMA weight for the learned lead-to-ours offset |
+| `QUOTER_REF_STALE_MS` | `2000` | ignore the lead if it has not updated within this |
+| `QUOTER_TIERS` | `1` | quotes per side; `2` adds a tight inner quote (trialled, measured worse here) |
+| `QUOTER_INNER_EDGE_FRAC` | `0.4` | inner tier's edge, as a fraction of the full edge |
+| `QUOTER_INNER_SIZE_FRAC` | `0.4` | inner tier's size, as a fraction of the clip |
+| `QUOTER_MAX_TPS` | `-1` (auto) | request rate cap; auto derives it from `EX_META` |
+| `QUOTER_MAX_BURST` | `8` | requests allowed back-to-back |
+| `QUOTER_MIN_REQUOTE_MS` | `0` | floor on time between requote cycles |
+
+## Building and testing
+
+Built from source inside the Dockerfile (`CGO_ENABLED=0`, hash-verified against
+`go.sum`). There is no Go toolchain requirement on the host:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w golang:1.23-alpine go test ./...
+../tests/run_tests.sh unit          # this plus the Python seats' tests
+```
