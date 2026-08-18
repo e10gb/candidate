@@ -31,11 +31,7 @@ type config struct {
 	// The edge is sized from measured volatility: EdgeVolMult * stdev of the mid
 	// over VolWindow, floored at EdgeTicks and capped at MaxEdgeTicks. Set
 	// EdgeVolMult to 0 for a fixed edge of EdgeTicks.
-	EdgeVolMult float64
-	// MaxEdgeFrac caps the edge at a fraction of the current price, so the cap
-	// transfers to an instrument trading at a different level. MaxEdgeTicks is an
-	// optional absolute backstop, off by default.
-	MaxEdgeFrac  float64
+	EdgeVolMult  float64
 	MaxEdgeTicks float64
 	VolWindow    time.Duration
 	// MinEdgeTicks is the margin every quote must keep against fair value, no
@@ -92,13 +88,6 @@ func loadConfig() config {
 		// market. The cap bounds that. Its exact value is not resolvable at the
 		// noise level measured, so 20 is chosen to bound the pathological case, not
 		// as a tuned optimum.
-		//
-		// MaxEdgeFrac expresses the same cap as a fraction of price, for a market
-		// where risk scales with price level. It is off by default because this
-		// market's moves are absolute (the sim's mover steps 20-60 points whatever
-		// the price), not because it measured worse -- that comparison did not
-		// survive repetition either. Set one or the other.
-		MaxEdgeFrac:  envFloat("QUOTER_MAX_EDGE_FRAC", 0),
 		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 20),
 		VolWindow: time.Duration(envInt("QUOTER_VOL_WINDOW_MS", 2000)) *
 			time.Millisecond,

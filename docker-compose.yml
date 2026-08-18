@@ -53,7 +53,7 @@ services:
       SENDER: ${SENDER:-QUOTE001}
       TAKER_SENDER: ${TAKER_SENDER:-PYTKR001}
       HEDGER_SENDER: ${HEDGER_SENDER:-HEDGE001}
-      TAKER_FEED: AAH6
+      TAKER_FEED: ${TAKER_FEED:-AAH6}
       TAKER_RUN: "86400"
       # Desk layout, chosen from measurement (NOTES.md "market-speed campaign"):
       # the quoter sits on a quieter sibling and prices it off whichever contract
@@ -84,6 +84,7 @@ services:
       HEDGE_SLIP: ${HEDGE_SLIP:-}
       HEDGE_URGENT: ${HEDGE_URGENT:-}
       HEDGE_PASSIVE_MS: ${HEDGE_PASSIVE_MS:-}
+      HEDGE_INFLIGHT_TTL: ${HEDGE_INFLIGHT_TTL:-}
     depends_on:
       - exchange
     restart: on-failure

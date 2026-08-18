@@ -387,10 +387,8 @@ func (q *quoter) volatility() float64 {
 // with the cap binding regularly and the widest quotes reaching 240 against a
 // market spread of 1-5.
 //
-// Two forms are available and only one should be set. MaxEdgeTicks is absolute;
-// MaxEdgeFrac is a fraction of the current price, for a market where risk scales
-// with price level. See NOTES.md -- the choice between them did not separate from
-// noise, so this is a judgement, not a measured result.
+// A price-relative form of this cap was tried and removed: it measured no better
+// and left two knobs doing one job. See NOTES.md.
 func (q *quoter) edge() float64 {
 	e := q.cfg.EdgeTicks // floor: never quote tighter than this
 	if q.cfg.EdgeVolMult > 0 {
@@ -398,17 +396,8 @@ func (q *quoter) edge() float64 {
 			e = v
 		}
 	}
-	// Reference price for the cap comes from the same samples as the volatility,
-	// so the two can never be derived from different state.
-	if q.cfg.MaxEdgeFrac > 0 && len(q.mids) > 0 {
-		if ref := q.mids[len(q.mids)-1].mid; ref > 0 {
-			if cap := q.cfg.MaxEdgeFrac * ref; e > cap {
-				e = cap
-			}
-		}
-	}
 	if q.cfg.MaxEdgeTicks > 0 && e > q.cfg.MaxEdgeTicks {
-		e = q.cfg.MaxEdgeTicks // optional absolute backstop; off by default
+		e = q.cfg.MaxEdgeTicks
 	}
 	return e
 }
