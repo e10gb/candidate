@@ -55,6 +55,20 @@ hpnl=$(last_field "$H" pnl);  hpos=$(grep -o 'hedger=[-0-9]*' "$H" | tail -1 | c
 hedges=$(last_field "$H" hedges); hlots=$(last_field "$H" traded)
 total=$(( ${qpnl:-0} + ${tpnl:-0} + ${hpnl:-0} ))
 
+# Liquidation-marked PnL: what each seat would keep after closing its position
+# against the book, rather than valuing it at the mid. The session ends by
+# liquidating whatever is left, so this is the number that survives the close --
+# `pnl` is the optimistic one.
+qliq=$(last_field "$Q" liq); tliq=$(last_field "$T" liq); hliq=$(last_field "$H" liq)
+totliq=$(( ${qliq:-0} + ${tliq:-0} + ${hliq:-0} ))
+netpos=$(( ${qpos:-0} + ${tpos:-0} + ${hpos:-0} ))
+exitcost=$(( totliq - total ))
+# Volume actually done, so the result can be read per lot rather than in the
+# abstract: a small loss on huge volume and a small loss on none are different.
+qlots=$(grep -oE '^\[?[^ ]*\]? *[0-9:.]* *fill [BS] [0-9]+' "$Q" |
+        awk '{v+=$NF} END{print v+0}')
+tlots=$(grep -c 'fill' "$T" 2>/dev/null || echo 0)
+
 read -r dmax dmean dover <<<"$(grep -o 'desk=[-0-9]*' "$H" | cut -d= -f2 | awk '
   {n++; a=($1<0?-$1:$1); s+=a; if(a>mx)mx=a; if(a>=25)o++}
   END{ if(!n){print "- - -"; exit} printf "%d %.2f %.0f", mx, s/n, 100*o/n }')"
@@ -82,13 +96,21 @@ last_ts=$(grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' "$Q" | tail -1)
   echo
   echo '## Seats'
   echo
-  echo '| seat | position | PnL | fills |'
-  echo '|---|---|---|---|'
-  printf '| quoter | %s | %s | %s |\n' "${qpos:--}" "${qpnl:--}" "${qfills:--}"
-  printf '| taker  | %s | %s | %s |\n' "${tpos:--}" "${tpnl:--}" "${tfills:--}"
-  printf '| hedger | %s | %s | %s hedges, %s lots |\n' \
-     "${hpos:--}" "${hpnl:--}" "${hedges:--}" "${hlots:--}"
-  printf '| **desk** | | **%s** | |\n' "$total"
+  echo '| seat | position | PnL (at mid) | PnL (if closed out) | fills |'
+  echo '|---|---|---|---|---|'
+  printf '| quoter | %s | %s | %s | %s |\n' \
+     "${qpos:--}" "${qpnl:--}" "${qliq:--}" "${qfills:--}"
+  printf '| taker  | %s | %s | %s | %s |\n' \
+     "${tpos:--}" "${tpnl:--}" "${tliq:--}" "${tfills:--}"
+  printf '| hedger | %s | %s | %s | %s hedges, %s lots |\n' \
+     "${hpos:--}" "${hpnl:--}" "${hliq:--}" "${hedges:--}" "${hlots:--}"
+  printf '| **desk** | **%s** | %s | **%s** | |\n' "$netpos" "$total" "$totliq"
+  echo
+  printf -- '**Bottom line: %s** after closing out. ' "$totliq"
+  printf 'Marking at the mid would say %s; the difference (%s) is what the residual\n' \
+     "$total" "$exitcost"
+  printf 'position of %s lots costs to exit. The session ends by liquidating, so the\n' "$netpos"
+  printf 'closed-out figure is the one that counts.\n'
   echo
   echo '## Risk'
   echo
