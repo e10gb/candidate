@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Desk hedger.
 
-Keeps the desk's *combined* position -- quoter + taker + hedger -- near zero.
+Keeps the desk's *combined* position -- quoter + taker + hedger, summed across
+every contract they trade -- near zero, hedging in the most liquid one.
 When the other seats accumulate exposure, this reduces it. It is the seat that is
 allowed to pay for speed -- a small position held for a while is cheap, a large one
 held for a second is not -- but it only pays when it has to: modest exposure is
@@ -32,7 +33,9 @@ Config (env):
   HEDGE_CLIP       max size per hedge order              (default 25)
   HEDGE_SLIP       ticks through the touch we will pay   (default 10)
   HEDGE_INTERVAL   seconds between checks                (default 0.05)
-  HEDGE_MAX_TPS    self-imposed request rate cap         (default 20)
+  HEDGE_MAX_TPS    self-imposed request rate cap         (default 20; lowered
+                   automatically if the exchange's EX_META declares a tighter
+                   max_tps -- a disconnected hedger is no risk control at all)
   HEDGE_URGENT     exposure at/above which we cross at once (default 15)
   HEDGE_PASSIVE_MS how long to rest before crossing        (default 300)
   HEDGE_PASSIVE_IMPROVE  ticks to improve on the touch     (default 1)
@@ -105,6 +108,48 @@ def flip(side):
     return "S" if side == "B" else "B"
 
 
+def parse_meta(raw):
+    """EX_META value: space-separated key=value pairs, integers throughout."""
+    out = {}
+    for part in raw.split():
+        k, _, v = part.partition("=")
+        try:
+            out[k] = int(v)
+        except ValueError:
+            pass
+    return out
+
+
+async def fetch_meta(nc, feed, wait=20.0):
+    """Read the feed's EX_META entry, retrying briefly: on a fresh stack the
+    exchange may not have created the bucket before this seat connects."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            js = nc.jetstream()
+            kv = await js.key_value("EX_META")
+            entry = await kv.get(feed)
+            return parse_meta(entry.value.decode())
+        except Exception as err:
+            if time.monotonic() > deadline:
+                print(f"[hedger] EX_META unavailable ({err}); defaults apply", flush=True)
+                return {}
+            await asyncio.sleep(1.0)
+
+
+def to_grid(px, tick, up):
+    """Snap a price onto the instrument's tick grid. Floor division keeps
+    negative prices (legal here) correct; marketable prices round through the
+    touch -- up for buys, down for sells -- so rounding never strands an order
+    on the wrong side of it."""
+    if tick <= 1:
+        return px
+    base = (px // tick) * tick
+    if base == px:
+        return px
+    return base + tick if up else base
+
+
 class Hedger:
     def __init__(self, nc):
         self.nc = nc
@@ -133,6 +178,8 @@ class Hedger:
         self.cost_lots = 0
         self.cost_sum = 0.0
         self.min_gap = 1.0 / MAX_TPS if MAX_TPS > 0 else 0.0
+        self.clip = CLIP   # possibly clamped by the exchange's position_limit
+        self.tick = 1
 
     # ---- market data ------------------------------------------------------- #
 
@@ -230,18 +277,18 @@ class Hedger:
         """Take the spread to get flat now. Used when exposure is urgent, or when
         patience has already been tried and did not work."""
         side = "S" if exposure > 0 else "B"
-        size = min(abs(exposure), CLIP)
+        size = min(abs(exposure), self.clip)
         # Price is a slippage limit, not the expected fill price: the exchange
         # matches against resting orders at *their* prices, so this sweeps the book
         # from the touch and refuses to pay more than SLIP ticks through it.
         if side == "S":
             if self.best_bid is None:
                 return
-            price = self.best_bid - SLIP
+            price = to_grid(self.best_bid - SLIP, self.tick, up=False)
         else:
             if self.best_ask is None:
                 return
-            price = self.best_ask + SLIP
+            price = to_grid(self.best_ask + SLIP, self.tick, up=True)
 
         self.oid += 1
         parts = await self.request(
@@ -265,15 +312,16 @@ class Hedger:
     async def rest(self, exposure):
         """Try to get flat without paying the spread, by resting at the touch."""
         side = "S" if exposure > 0 else "B"
-        size = min(abs(exposure), CLIP)
+        size = min(abs(exposure), self.clip)
         if self.best_bid is None or self.best_ask is None:
             return
+        improve = PASSIVE_IMPROVE * self.tick   # one grid step, whatever the tick
         if side == "B":
-            price = self.best_bid + PASSIVE_IMPROVE
+            price = self.best_bid + improve
             if price >= self.best_ask:      # improving would cross: just join
                 price = self.best_bid
         else:
-            price = self.best_ask - PASSIVE_IMPROVE
+            price = self.best_ask - improve
             if price <= self.best_bid:
                 price = self.best_ask
 
@@ -335,6 +383,20 @@ class Hedger:
             return float(self.best_ask)
         return self.last_mark
 
+    def liq(self):
+        """What our position would actually fetch if closed now -- long sells into
+        the bid, short buys from the ask. `pnl` marks at the mid; the session ends
+        by liquidating against the book, so this is the honest close-out number."""
+        own = self.positions["hedger"]
+        if own == 0:
+            return self.cash
+        if own > 0 and self.best_bid is not None:
+            return self.cash + own * self.best_bid
+        if own < 0 and self.best_ask is not None:
+            return self.cash + own * self.best_ask
+        m = self.mark()
+        return None if m is None else self.cash + own * m
+
     def pnl(self):
         """Our own mark-to-market. This is the *cost of the risk control*: the
         hedger crosses the spread every time, so it is expected to be negative.
@@ -349,11 +411,12 @@ class Hedger:
         while True:
             await asyncio.sleep(1.0)
             pos = " ".join(f"{k}={v}" for k, v in self.positions.items())
-            p = self.pnl()
+            p, l = self.pnl(), self.liq()
             cost = (self.cost_sum / self.cost_lots) if self.cost_lots else 0.0
             s = (f"desk={self.desk()} {pos} inflight={self.inflight} "
                  f"hedges={self.hedges} traded={self.traded} cash={self.cash} "
                  f"pnl={'n/a' if p is None else format(p, '.0f')} "
+                 f"liq={'n/a' if l is None else format(l, '.0f')} "
                  f"passive={self.passive_lots} crossed={self.crossed_lots} "
                  f"cost/lot={cost:.2f}")
             print(f"[hedger] {s}", flush=True)
@@ -363,9 +426,30 @@ class Hedger:
 async def main():
     nc = await nats.connect(NATS_URL, max_reconnect_attempts=-1)
     h = Hedger(nc)
+    # The exchange's own declared limits override guessed ones. Rate matters
+    # most here: exceeding max_tps disconnects the sender, and a disconnected
+    # hedger means the desk has no risk control at all -- so the gap is held to
+    # half the declared rate. position_limit caps how much one order may carry.
+    mt = await fetch_meta(nc, FEED)
+    h.tick = mt.get("ticksize", 1) or 1
+    if mt.get("position_limit", 0) > 0:
+        h.clip = min(h.clip, mt["position_limit"])
+    if mt.get("max_tps", 0) > 0:
+        h.min_gap = max(h.min_gap, 2.0 / mt["max_tps"])
+    print(f"[hedger] meta {FEED}: tick={h.tick} max_tps={mt.get('max_tps', 'n/a')} "
+          f"poslim={mt.get('position_limit', 'n/a')} -> clip={h.clip} "
+          f"min_gap={h.min_gap:.3f}s", flush=True)
     await nc.subscribe(f"ex.bbo.{FEED}", cb=h.on_bbo)
+    # Wildcard on the feed token: the seats do not all trade the same contract
+    # (the quoter sits on a quieter sibling of the taker's front month), and a
+    # hedger watching only one book would leave the others' exposure invisible.
+    # Contracts on one underlying are cash-settled at their listed price, so a
+    # lot of any of them carries the same unit risk and the signed sum across
+    # feeds is the desk's exposure; it is hedged in FEED, the liquid one. The
+    # residual is the spread between siblings, which is pinned in the sample
+    # market and small beside the outright risk being removed.
     for seat, sender in SEATS.items():
-        await nc.subscribe(f"ex.md.{FEED}.{sender}", cb=h.make_md_handler(seat, sender))
+        await nc.subscribe(f"ex.md.*.{sender}", cb=h.make_md_handler(seat, sender))
     print(f"[hedger] {SENDER} watching {sorted(SEATS.values())} on {FEED} "
           f"thresh={THRESH} clip={CLIP} slip={SLIP}", flush=True)
     await asyncio.gather(h.hedge_loop(), h.report_loop())
