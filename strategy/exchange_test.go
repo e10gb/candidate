@@ -98,3 +98,58 @@ func TestUnlimitedWhenRateIsZero(t *testing.T) {
 		}
 	}
 }
+
+// EX_META is the exchange's own statement of the contract's limits. The local
+// value is the first case verbatim; the second is what a grading market that
+// actually enforces limits could look like.
+func TestParseMeta(t *testing.T) {
+	local := "ticksize=1 ref_price=600 band=5000 min_volume=1 max_volume=10000000 " +
+		"position_limit=1000000000 max_tps=0 last_traded_price=612"
+	m := parseMeta(local)
+	if m.tickSize != 1 || m.maxTPS != 0 || m.positionLimit != 1000000000 {
+		t.Errorf("local meta parsed wrongly: %+v", m)
+	}
+	m = parseMeta("ticksize=5 max_tps=40 position_limit=50")
+	if m.tickSize != 5 || m.maxTPS != 40 || m.positionLimit != 50 {
+		t.Errorf("limited meta parsed wrongly: %+v", m)
+	}
+	if m := parseMeta("garbage no equals ticksize=x"); m.tickSize != 1 {
+		t.Errorf("unparsable input must fall back to tick 1, got %+v", m)
+	}
+}
+
+// Breaching max_tps disconnects the sender, so the derived bucket must keep any
+// one-second window under the declared limit: burst + rate <= 0.8 * max_tps.
+func TestApplyMetaKeepsHeadroom(t *testing.T) {
+	cfg := testCfg()
+	cfg.MaxTPS = -1 // auto
+	applyMeta(&cfg, meta{tickSize: 1, maxTPS: 40, positionLimit: 1000000000})
+	if cfg.MaxTPS != 20 || cfg.MaxBurst != 8 {
+		t.Errorf("max_tps=40 should give rate 20 burst 8, got %d/%d", cfg.MaxTPS, cfg.MaxBurst)
+	}
+	if worst := cfg.MaxBurst + cfg.MaxTPS; worst > 32 { // 0.8 * 40
+		t.Errorf("worst one-second window %d exceeds 80%% of the declared limit", worst)
+	}
+
+	cfg = testCfg()
+	cfg.MaxTPS = -1
+	applyMeta(&cfg, meta{tickSize: 1, maxTPS: 0})
+	if cfg.MaxTPS != 0 {
+		t.Errorf("a declared limit of 0 means unlimited, got rate %d", cfg.MaxTPS)
+	}
+
+	cfg = testCfg()
+	cfg.MaxTPS = 5 // explicit override wins over auto-derivation
+	applyMeta(&cfg, meta{tickSize: 1, maxTPS: 100})
+	if cfg.MaxTPS != 5 {
+		t.Errorf("an explicit cap must survive applyMeta, got %d", cfg.MaxTPS)
+	}
+}
+
+func TestApplyMetaClampsPositionLimit(t *testing.T) {
+	cfg := testCfg()
+	applyMeta(&cfg, meta{tickSize: 1, positionLimit: 10})
+	if cfg.MaxPos != 10 {
+		t.Errorf("MaxPos should clamp to the exchange limit 10, got %d", cfg.MaxPos)
+	}
+}

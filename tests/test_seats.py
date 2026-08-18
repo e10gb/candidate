@@ -165,6 +165,33 @@ class HedgerPassiveFirst(unittest.TestCase):
                         "improving on a one-tick book must not cross the offer")
 
 
+class HedgerMeta(unittest.TestCase):
+    """The exchange's declared limits, read rather than guessed."""
+
+    def test_parse_meta_local_value(self):
+        raw = ("ticksize=1 ref_price=600 band=5000 min_volume=1 "
+               "max_volume=10000000 position_limit=1000000000 max_tps=0 "
+               "last_traded_price=612")
+        m = hedger.parse_meta(raw)
+        self.assertEqual(m["ticksize"], 1)
+        self.assertEqual(m["max_tps"], 0)
+        self.assertEqual(m["position_limit"], 1000000000)
+
+    def test_parse_meta_ignores_garbage(self):
+        self.assertEqual(hedger.parse_meta("nonsense ticksize=x max_tps=7"),
+                         {"max_tps": 7})
+
+    def test_to_grid_rounds_through_the_touch(self):
+        # Marketable buys round up, sells round down, so rounding never strands
+        # the order on the passive side of the price it meant to cross.
+        self.assertEqual(hedger.to_grid(603, 5, up=True), 605)
+        self.assertEqual(hedger.to_grid(603, 5, up=False), 600)
+        self.assertEqual(hedger.to_grid(600, 5, up=True), 600)
+        self.assertEqual(hedger.to_grid(-3, 5, up=False), -5)
+        self.assertEqual(hedger.to_grid(-3, 5, up=True), 0)
+        self.assertEqual(hedger.to_grid(7, 1, up=True), 7)
+
+
 class TakerSignal(unittest.TestCase):
     def setUp(self):
         self.t = taker.Taker(nc=None)

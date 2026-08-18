@@ -13,6 +13,7 @@ import (
 func testCfg() config {
 	return config{
 		Sender:       "QUOTE001",
+		Tiers:        1, // single tier unless a test opts in
 		Feed:         "AAH6",
 		Clip:         5,
 		MaxPos:       25,
@@ -28,6 +29,12 @@ func testCfg() config {
 	}
 }
 
+// outer returns the widest tier on each side, which is the one every
+// pre-existing test was written against.
+func outer(bids, asks []target) (target, target) {
+	return bids[len(bids)-1], asks[len(asks)-1]
+}
+
 // newTestQuoter builds a quoter with a known book and no network.
 func newTestQuoter(t *testing.T, cfg config, bid, ask int) *quoter {
 	t.Helper()
@@ -39,10 +46,11 @@ func newTestQuoter(t *testing.T, cfg config, bid, ask int) *quoter {
 
 func TestQuotesStraddleMidByEdge(t *testing.T) {
 	q := newTestQuoter(t, testCfg(), 648, 652) // fair 650
-	bid, ask, ok := q.desired()
+	bids, asks, ok := q.desired()
 	if !ok {
 		t.Fatal("expected a quote on a healthy two-sided book")
 	}
+	bid, ask := outer(bids, asks)
 	if bid.px != 648 || ask.px != 652 {
 		t.Errorf("want 648/652 at edge 2 around fair 650, got %d/%d", bid.px, ask.px)
 	}
@@ -58,10 +66,11 @@ func TestSkewNeverQuotesThroughMinEdge(t *testing.T) {
 	q := newTestQuoter(t, cfg, 648, 652) // fair 650
 	for _, pos := range []int{0, 10, 20, 25, -10, -25} {
 		q.position = pos
-		bid, ask, ok := q.desired()
+		bids, asks, ok := q.desired()
 		if !ok {
 			t.Fatalf("pos=%d: expected a quote", pos)
 		}
+		bid, ask := outer(bids, asks)
 		if bid.vol > 0 && float64(bid.px) > 650-cfg.MinEdgeTicks {
 			t.Errorf("pos=%d: bid %d is inside the %.0f-tick margin around fair 650",
 				pos, bid.px, cfg.MinEdgeTicks)
@@ -76,9 +85,11 @@ func TestSkewNeverQuotesThroughMinEdge(t *testing.T) {
 func TestSkewLeansAgainstInventory(t *testing.T) {
 	q := newTestQuoter(t, testCfg(), 648, 652)
 	q.position = 20 // long: we want to sell
-	longBid, longAsk, _ := q.desired()
+	lb, la, _ := q.desired()
+	longBid, longAsk := outer(lb, la)
 	q.position = -20 // short: we want to buy
-	shortBid, shortAsk, _ := q.desired()
+	sb, sa, _ := q.desired()
+	shortBid, shortAsk := outer(sb, sa)
 
 	if longAsk.px >= shortAsk.px {
 		t.Errorf("long should offer cheaper than short: long ask %d, short ask %d",
@@ -102,10 +113,11 @@ func TestSkewScalesWithTheEdge(t *testing.T) {
 		cfg.SkewFrac = 1.0
 		q := newTestQuoter(t, cfg, 1000-int(edge)-5, 1000+int(edge)+5)
 		q.position = cfg.MaxPos / 2 // half inventory -> half a lean
-		bid, _, ok := q.desired()
+		b, a, ok := q.desired()
 		if !ok {
 			t.Fatalf("edge %.0f: expected a quote", edge)
 		}
+		bid, _ := outer(b, a)
 		// Unskewed the bid would sit at fair-edge; the lean is how much further.
 		return (1000 - edge) - float64(bid.px)
 	}
@@ -128,12 +140,167 @@ func TestFullInventoryLeansToTheMinimumEdge(t *testing.T) {
 	cfg.SkewFrac = 1.0
 	q := newTestQuoter(t, cfg, 975, 1025) // fair 1000
 	q.position = cfg.MaxPos               // maximum long: we want to sell
-	_, ask, ok := q.desired()
+	b, a, ok := q.desired()
 	if !ok {
 		t.Fatal("expected a quote")
 	}
+	_, ask := outer(b, a)
 	if want := 1000 + int(cfg.MinEdgeTicks); ask.px != want {
 		t.Errorf("ask should sit at the minimum edge above fair (%d), got %d", want, ask.px)
+	}
+}
+
+// Two tiers: a tight small quote to earn calm-market flow, and a wide one holding
+// the size where a sweep cannot take it cheaply. A single wide quote is safe but
+// forfeits the easy flow, which is why fill counts were only a few dozen a run.
+func TestInnerTierIsTighterAndSmaller(t *testing.T) {
+	cfg := testCfg()
+	cfg.Tiers = 2
+	cfg.InnerEdgeFrac, cfg.InnerSizeFrac = 0.4, 0.4
+	cfg.EdgeTicks = 20
+	q := newTestQuoter(t, cfg, 900, 1100) // fair 1000, wide enough not to clamp
+
+	bids, asks, ok := q.desired()
+	if !ok {
+		t.Fatal("expected quotes")
+	}
+	if len(bids) != 2 || len(asks) != 2 {
+		t.Fatalf("expected 2 tiers a side, got %d/%d", len(bids), len(asks))
+	}
+	if bids[0].px <= bids[1].px {
+		t.Errorf("inner bid %d should be tighter (higher) than outer %d",
+			bids[0].px, bids[1].px)
+	}
+	if asks[0].px >= asks[1].px {
+		t.Errorf("inner ask %d should be tighter (lower) than outer %d",
+			asks[0].px, asks[1].px)
+	}
+	if bids[0].vol >= bids[1].vol {
+		t.Errorf("inner size %d should be smaller than outer %d",
+			bids[0].vol, bids[1].vol)
+	}
+}
+
+// Tiers share one position limit; they must not each quote the full remaining
+// room and breach it between them.
+func TestTiersShareThePositionLimit(t *testing.T) {
+	cfg := testCfg()
+	cfg.Tiers = 2
+	q := newTestQuoter(t, cfg, 900, 1100)
+	q.position = cfg.MaxPos - 3 // only 3 lots of room left, across both tiers
+
+	bids, _, _ := q.desired()
+	total := 0
+	for _, b := range bids {
+		total += b.vol
+	}
+	if total > 3 {
+		t.Errorf("tiers would buy %d lots with only 3 of room", total)
+	}
+}
+
+// Pricing off a leading instrument. Which contract leads is discovered from
+// activity, the basis between them is learned, and a lead that goes quiet is
+// ignored -- a stale lead is worse than our own book.
+func TestFairValueFollowsTheLeadInstrument(t *testing.T) {
+	cfg := testCfg()
+	cfg.Feed = "AAM6" // we quote the back month
+	cfg.UseRef = true
+	// The basis must adapt *slowly*: it stands for the structural offset between
+	// the contracts, not the transient lag we are trying to trade. Learn it fast
+	// and it absorbs the lead's move on the very tick we wanted to react to.
+	cfg.BasisAlpha = 0.05
+	cfg.RefStale = time.Second
+	q := newTestQuoter(t, cfg, 995, 1005) // our mid 1000
+
+	q.mu.Lock()
+	own := q.fairValue()
+	q.mu.Unlock()
+	if own != 1000 {
+		t.Errorf("with no lead seen yet, fair is our own mid; got %.1f", own)
+	}
+
+	// The front month trades at 900 and is the busier contract: basis is +100.
+	q.onAnyBBO(&nats.Msg{Data: []byte("1 AAH6 895 5 905 5")})
+	q.mu.Lock()
+	fair, lead := q.fairValue(), q.refFeed
+	q.mu.Unlock()
+	if lead != "AAH6" {
+		t.Fatalf("expected AAH6 to be picked as the lead, got %q", lead)
+	}
+	if fair != 1000 {
+		t.Errorf("basis should absorb the level difference, got %.1f", fair)
+	}
+
+	// The lead moves up 40. Our own book has not caught up, but fair should move
+	// nearly all the way with it -- that gap is exactly what gets picked off.
+	q.onAnyBBO(&nats.Msg{Data: []byte("1 AAH6 935 5 945 5")})
+	q.mu.Lock()
+	fair = q.fairValue()
+	q.mu.Unlock()
+	if fair < 1035 {
+		t.Errorf("fair should follow the lead toward 1040, got %.1f", fair)
+	}
+}
+
+// Quoting the most active contract and then pricing it off a quieter sibling
+// would import lag rather than remove it.
+func TestTheBusiestContractDoesNotFollowAnyone(t *testing.T) {
+	cfg := testCfg()
+	cfg.Feed = "AAH6"
+	cfg.UseRef = true
+	cfg.BasisAlpha = 0.05
+	cfg.RefStale = time.Second
+	q := newTestQuoter(t, cfg, 995, 1005)
+
+	// Our own contract updates far more often than its sibling.
+	for i := 0; i < 20; i++ {
+		q.onAnyBBO(&nats.Msg{Data: []byte("1 AAH6 995 5 1005 5")})
+	}
+	q.onAnyBBO(&nats.Msg{Data: []byte("1 AAM6 895 5 905 5")})
+
+	q.mu.Lock()
+	lead, fair := q.refFeed, q.fairValue()
+	q.mu.Unlock()
+	if lead != "" {
+		t.Errorf("the busiest contract should follow nothing, picked %q", lead)
+	}
+	if fair != 1000 {
+		t.Errorf("fair should be our own mid, got %.1f", fair)
+	}
+}
+
+func TestUnrelatedUnderlyingIsIgnored(t *testing.T) {
+	cfg := testCfg()
+	cfg.Feed = "AAM6"
+	cfg.UseRef = true
+	q := newTestQuoter(t, cfg, 995, 1005)
+	for i := 0; i < 5; i++ {
+		q.onAnyBBO(&nats.Msg{Data: []byte("1 ZZH6 100 5 110 5")})
+	}
+	q.mu.Lock()
+	lead := q.refFeed
+	q.mu.Unlock()
+	if lead != "" {
+		t.Errorf("a different underlying must not be used as a lead, picked %q", lead)
+	}
+}
+
+func TestStaleLeadIsIgnored(t *testing.T) {
+	cfg := testCfg()
+	cfg.Feed = "AAM6"
+	cfg.UseRef = true
+	cfg.BasisAlpha = 0.05
+	cfg.RefStale = 20 * time.Millisecond
+	q := newTestQuoter(t, cfg, 995, 1005)
+
+	q.onAnyBBO(&nats.Msg{Data: []byte("1 AAH6 895 5 905 5")})
+	time.Sleep(40 * time.Millisecond)
+	q.mu.Lock()
+	fair := q.fairValue()
+	q.mu.Unlock()
+	if fair != 1000 {
+		t.Errorf("a lead that has gone quiet must be ignored, got %.1f", fair)
 	}
 }
 
@@ -158,7 +325,8 @@ func TestSizeNeverBreachesPositionLimit(t *testing.T) {
 	cfg := testCfg()
 	q := newTestQuoter(t, cfg, 648, 652)
 	q.position = cfg.MaxPos - 2 // room for 2 more
-	bid, ask, _ := q.desired()
+	b, a, _ := q.desired()
+	bid, ask := outer(b, a)
 	if bid.vol != 2 {
 		t.Errorf("bid size should be capped to the remaining 2, got %d", bid.vol)
 	}
@@ -166,7 +334,8 @@ func TestSizeNeverBreachesPositionLimit(t *testing.T) {
 		t.Errorf("sell side should be unrestricted, got %d", ask.vol)
 	}
 	q.position = cfg.MaxPos
-	bid, _, _ = q.desired()
+	b, a, _ = q.desired()
+	bid, _ = outer(b, a)
 	if bid.vol != 0 {
 		t.Errorf("at the limit the buy side must not quote, got %d", bid.vol)
 	}
@@ -318,14 +487,51 @@ func TestFillSideFromExecutionAndTrade(t *testing.T) {
 
 func TestPartialFillLeavesOrderResting(t *testing.T) {
 	q := newTestQuoter(t, testCfg(), 648, 652)
-	q.bid = resting{id: "bbbbbbbb", px: 648, vol: 5}
+	q.bids[0] = resting{id: "bbbbbbbb", px: 648, vol: 5}
 	q.onOwnMD(&nats.Msg{Data: []byte("1 E O:aaaaaaaa QUOTE001:bbbbbbbb 2 648 1 S")})
-	if !q.bid.live() || q.bid.vol != 3 {
+	if !q.bids[0].live() || q.bids[0].vol != 3 {
 		t.Errorf("a partial fill should leave 3 resting, got live=%v vol=%d",
-			q.bid.live(), q.bid.vol)
+			q.bids[0].live(), q.bids[0].vol)
 	}
 	q.onOwnMD(&nats.Msg{Data: []byte("1 E O:aaaaaaaa QUOTE001:bbbbbbbb 3 648 1 S")})
-	if q.bid.live() {
+	if q.bids[0].live() {
 		t.Error("a fully filled order should no longer be recorded as resting")
+	}
+}
+
+// Negative prices are legal on this exchange (probed), so grid rounding must
+// floor mathematically rather than truncate toward zero.
+func TestTickRounding(t *testing.T) {
+	for _, tc := range []struct{ px, tick, floor, ceil int }{
+		{603, 5, 600, 605},
+		{600, 5, 600, 600},
+		{-3, 5, -5, 0},
+		{-7, 5, -10, -5},
+	} {
+		if got := floorToTick(tc.px, tc.tick); got != tc.floor {
+			t.Errorf("floorToTick(%d,%d) = %d, want %d", tc.px, tc.tick, got, tc.floor)
+		}
+		if got := ceilToTick(tc.px, tc.tick); got != tc.ceil {
+			t.Errorf("ceilToTick(%d,%d) = %d, want %d", tc.px, tc.tick, got, tc.ceil)
+		}
+	}
+}
+
+func TestQuotesSitOnTheTickGrid(t *testing.T) {
+	cfg := testCfg()
+	cfg.TickSize = 5
+	cfg.EdgeTicks = 12
+	q := newTestQuoter(t, cfg, 940, 1060) // fair 1000
+	bids, asks, ok := q.desired()
+	if !ok {
+		t.Fatal("expected a quote")
+	}
+	bid, ask := outer(bids, asks)
+	if bid.px%5 != 0 || ask.px%5 != 0 {
+		t.Errorf("quotes off the tick grid: bid %d ask %d", bid.px, ask.px)
+	}
+	if float64(bid.px) > 1000-cfg.EdgeTicks || float64(ask.px) < 1000+cfg.EdgeTicks {
+		t.Errorf("grid rounding must move prices away from fair, not toward it: %d/%d",
+			bid.px, ask.px)
 	}
 }
