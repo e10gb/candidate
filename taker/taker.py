@@ -182,6 +182,20 @@ class Taker:
             return float(self.best_ask)      # short: we would buy from the ask
         return self.last_mark
 
+    def liq(self):
+        """What the position would actually fetch if closed now: a long sells into
+        the bid, a short buys from the ask. `pnl` marks at the mid, which is fair
+        value but not what you would receive. The session ends by liquidating
+        against the book, so this is the number that survives the close."""
+        if self.position == 0:
+            return self.cash
+        if self.position > 0 and self.best_bid is not None:
+            return self.cash + self.position * self.best_bid
+        if self.position < 0 and self.best_ask is not None:
+            return self.cash + self.position * self.best_ask
+        m = self.mark()
+        return None if m is None else self.cash + self.position * m
+
     def pnl(self):
         m = self.mark()
         if m is None:
@@ -189,9 +203,10 @@ class Taker:
         return self.cash + self.position * m
 
     async def publish_status(self):
-        p = self.pnl()
+        p, l = self.pnl(), self.liq()
         s = (f"pos={self.position} cash={self.cash:.0f} "
-             f"pnl={'n/a' if p is None else format(p, '.0f')} fills={self.fills}")
+             f"pnl={'n/a' if p is None else format(p, '.0f')} "
+             f"liq={'n/a' if l is None else format(l, '.0f')} fills={self.fills}")
         print(f"[taker] {s}", flush=True)
         await self.nc.publish(f"strat.{SENDER}.status", s.encode())
 
