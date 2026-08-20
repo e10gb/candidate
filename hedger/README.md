@@ -44,15 +44,22 @@ position held for a while is cheap, a large one held for a second is not.
 
 ## Configuration
 
+
+> **The shipped desk overrides some of these.** The table below is the code's
+> own defaults, which apply when a variable is unset. `docker-compose.yml`
+> sets several of them for the desk as configured, with the measurements
+> that justify each in comments beside them. Where the two differ, compose
+> wins at runtime.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `NATS_URL` | `nats://127.0.0.1:4222` | exchange connection |
 | `HEDGER_SENDER` | `HEDGE001` | our 8-char sender id |
 | `SENDER` | `QUOTE001` | the quoter's sender, to watch its fills |
 | `TAKER_SENDER` | `PYTKR001` | the taker's sender, to watch its fills |
-| `HEDGER_FEED` | `$TAKER_FEED`, else `AAH6` | contract we hedge *in* |
-| `HEDGE_THRESH` | `5` | desk position that triggers a hedge |
-| `HEDGE_URGENT` | `15` | exposure at/above which we cross immediately |
+| `HEDGER_FEED` | `$TAKER_FEED`, else `AAH6` (compose: `AAM6`) | contract we hedge *in* |
+| `HEDGE_THRESH` | `5` (compose: `20`) | desk position that triggers a hedge. Raised because the taker now holds a deliberate reversion position, and a tight threshold made the hedger close its winning trade every swing |
+| `HEDGE_URGENT` | `15` | exposure at/above which we cross immediately. Clamped up to `HEDGE_THRESH` if set below it -- underneath the threshold every hedge is urgent on arrival and the passive path is silently dead |
 | `HEDGE_PASSIVE_MS` | `300` | how long to rest before giving up and crossing |
 | `HEDGE_PASSIVE_IMPROVE` | `1` | ticks to improve on the touch when resting |
 | `HEDGE_CLIP` | `25` | max size per hedge order (clamped by `position_limit`) |

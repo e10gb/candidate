@@ -83,6 +83,15 @@ MAX_TPS = env("HEDGE_MAX_TPS", 20, int)
 # URGENT is the size above which we stop being patient and take the spread hit
 # immediately. Below it, patience costs a little time and saves the spread.
 URGENT = env("HEDGE_URGENT", 15, int)
+# URGENT below THRESH silently disables the passive path: every hedge is already
+# urgent the moment it triggers, so nothing is ever worked patiently. That is a
+# self-contradictory configuration rather than a choice, so it is clamped and
+# said out loud.
+if URGENT < THRESH:
+    print(f"[hedger] HEDGE_URGENT {URGENT} < HEDGE_THRESH {THRESH}: raising to "
+          f"{THRESH} (below the threshold it would disable passive hedging)",
+          flush=True)
+    URGENT = THRESH
 PASSIVE_MS = env("HEDGE_PASSIVE_MS", 300, int)
 # Ticks to improve on the touch when resting. 0 joins the back of the queue and
 # rarely fills in the time available; 1 puts us at the front and still buys below
