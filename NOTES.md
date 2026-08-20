@@ -38,55 +38,71 @@ trusts its siblings' bookkeeping inherits their bugs.
   but not lift; measured at 3.0 req/sec against its cap of 20, so it is nowhere
   near binding and was left alone rather than changed late.)
 
-**Results on the sample market.** Measured on the *shipped* configuration, full
-desk, pooled over 3 x 240s (717 samples of `held()` -- the position actually at the
-exchange):
+**Results on the shipped configuration.** Full desk, pooled over 3 x 240s
+(717 samples of `held()` -- the position actually at the exchange):
 
-| | |
-|---|---|
-| mean abs exposure | **4.58** |
-| median | **2** |
-| p95 / p99 | **20 / 25** |
-| max | 28 |
-| time at/over 10 lots | 18.1% |
-| time at/over 25 lots | 1.4% |
+| risk | | PnL per 240s | |
+|---|---|---|---|
+| mean abs exposure | **7.78** | quoter | **-1,341 +/- 1,091** |
+| median | 7 | desk (6 runs) | **~ -13,700** |
+| p95 / p99 | **18 / 24** | | |
+| time at/over 10 lots | 35.4% | | |
+| time at/over 25 lots | **0.8%** | | |
 
-Job 2 works: the desk is at or near flat half the time while the seats carry 30+
-gross, and the position limits are never breached. But it is not flat *all* the
-time -- it carries 10+ lots about a fifth of the session, and that is the honest
-shape of it.
+**Job 2 works.** The desk holds a median of 7 lots and spends under 1% of the
+session above 25, while the seats carry 30+ gross between them and no position
+limit is ever breached. It is not flat *all* the time -- a third of the session is
+spent above 10 lots -- and that is the honest shape of it.
 
-**Quantiles, not a maximum.** Every earlier version of this paragraph quoted a mean
-and a max, and the numbers moved every time I measured (1.5, then 3.9-5.3, then
-2.3-5.3). The mean moved because short windows are noisy; the *max* moved because
-the maximum of N samples grows with N, so a max from 240s is not comparable with
-one from 120s. It is not a property of the desk at all, it is a property of how
-long you watched. Quantiles and time-above-threshold do not have that problem,
-which is why they are what is quoted now, pooled across runs rather than taken from
-whichever run read best.
+**Job 1 does not.** The quoter is a small, consistent loss (-1,341, interval
+excluding zero) and the desk loses ~13,700 per 240s, most of it the taker.
 
-On Job 1 the answer depends on whether the taker is running, and the full
-picture took a 2x2 to establish because my first comparison changed two variables
-at once (taker presence *and* hedger feed):
+**Quantiles, not a maximum.** Earlier versions of this paragraph quoted a mean and
+a max, and the numbers moved every time (1.5, then 3.9-5.3, then 2.3-5.3). The mean
+moved because short windows are noisy; the *max* moved because the maximum of N
+samples grows with N, so a max over 240s is not comparable with one over 120s. It
+is a property of how long you watched, not of the desk.
 
-| quoter PnL per 240s | hedger on AAM6 | hedger on AAH6 |
-|---|---|---|
-| quoter + hedger only | **+13,173** (3/3 positive) | not measured |
-| full desk, taker running | -274 +/- 3,583 | **+1,092 +/- 5,010** (shipped) |
+**Why the quoter loses -- the one finding that explains the rest.** Splitting each
+fill into edge captured at the fill plus subsequent drift shows the quoted spread
+earns nothing: across quoted spreads from 6 to 80 -- a thirteen-fold range -- the
+edge captured stays within +/-1.5 of zero. We are filled at approximately the mid
+whatever we quote, because almost all our fills come from the sample market's
+background quoters *repricing through us* rather than anyone crossing a spread to
+us. Detail in "Why the quoter cannot earn a spread here" below. No spread width,
+hedging setting or inventory cap addresses that, which is why every configuration
+swept lands between roughly -3,000 and -20,000 with overlapping intervals.
 
-**Standalone the quoter is profitable, every run. With the taker running it is
-break-even, regardless of where the hedger sits** -- which killed my published
-hypothesis that the desk was following its own hedger's impact on the reference
-book. The honest headline is the shipped cell.
+**Retracted along the way.** An earlier version of this summary claimed the quoter
+was profitable standalone (+13,173, 3 of 3 runs). That was measured before the
+hedger's in-flight accounting was fixed, when it under-hedged and left inventory on
+the book; re-running the same configuration with correct hedging gave -2,573 and
+-3,983. The claim is withdrawn. Four others went the same way. The last two are the
+instructive ones: `TAKER_MODE=reversion`, which I called the largest single effect in the
+project on four runs and which a seven-repeat sweep reduced to noise with a standard
+deviation of 25,018; and a compaction regression that a deliberately interleaved six-run
+A/B showed with no overlap between the arms, and that a second A/B of the same design
+erased completely. All five retractions are kept in place below rather than tidied away.
+The pattern -- a handful of agreeing runs treated as evidence -- is the most useful thing
+in this file, and the last instance of it survived a test I had designed specifically to
+be trustworthy.
 
-The one defensible taker lever -- sizing it down (clip 3 to 1, max position 30 to
-10), which caps exposure without fitting its signal -- was then tested and
-**failed**: quoter -240 +/- 12,145, with desk risk *worse* (34.9% of the session
-at/over 10 lots against 18.1%). Not shipped. A 3x size cut producing no
-improvement says the damage is not proportional impact; the taker trades at the
-same moments the market moves, so its flow contaminates the reference exactly when
-the quoter is most exposed, and that correlation survives shrinking it. That
-explanation is consistent with all four cells but was not separately tested.
+**Reference pricing does not work, for a second and more interesting reason.** Making
+the quoter report which contract it prices off revealed that it always picks itself: the
+lead is chosen by counting BBO updates, and our own quoting inflates our own feed's
+count past the real lead's (AAH6 leads AAM6 by 11% with the desk switched off; we add
+more than that). The feature has been inert in every full-desk run here. Diagnosed and
+documented, deliberately not fixed -- see Session 9.
+
+**The sweep also caught a bug I had introduced.** Compacting the seats deleted three
+lines from the quoter's config literal while leaving every reader of them intact, so
+reference pricing silently switched itself off -- it compiled, `go vet` was clean and
+all 29 unit tests passed, because none of them exercised the env path the container
+actually uses. Fixed, with two tests that fail when it is reintroduced. What it *cost*
+is a different question, and my first two answers to it were both wrong: a controlled,
+interleaved six-run A/B said the compaction had cost ~9,000 a run, and a second one of
+the same design said the effect does not exist. Session 9 has both, and the reason the
+convincing one was wrong.
 
 **What I would not claim.** That any particular wide-edge setting is optimal; runs of
 identical configuration differ by more than the effects being compared. Resolving
@@ -95,9 +111,11 @@ than present a tuned-looking number a further run would overturn.
 
 **Known limitations.** The quoter trades one contract (default `AAM6`, priced off
 the lead); the hedger watches every contract and hedges the combined exposure in
-`AAH6`. The taker still loses money on its own merits -- momentum in a market that mean-reverts inside a band -- and I left
-its parameters alone rather than fit them to a market the brief says is not the
-graded one. The sample market deadlocks permanently if its book ever empties, which
+`AAH6`. The taker still loses money on its own merits -- momentum in a market that
+mean-reverts inside a band -- and I left its parameters alone rather than fit them to a
+market the brief says is not the graded one. Fading the move looked like the fix for
+several sessions; at seven repeats it is indistinguishable from momentum and merely
+far more volatile, so the shipped default stands (Session 9). The sample market deadlocks permanently if its book ever empties, which
 is a property of `sim/market.py`, not the desk.
 1
 **What I learned** To not let AI make assumptions or guess. Start testing from the beginning 
@@ -105,7 +123,7 @@ to see what numbers produce optimal output. Or, to keep a better track of guesse
 throughout the project.
 
 **How to read the rest of this file.** It is the working record, in the order things
-were discovered, including the wrong turns and two retractions. Roughly: exchange
+were discovered, including the wrong turns and all five retractions. Roughly: exchange
 probing and the reject-code catalogue; what the sample market looks like; the
 taker's bugs; why the first quoter lost money; the hedger; the three-seat result;
 the test suite; the edge sweeps and the methodology correction; clean-checkout
@@ -993,9 +1011,10 @@ sweeps through those levels on its way somewhere. Quoting tighter buys more of
 exactly the trade you did not want. Two-tier quoting is the right shape in a market
 with benign two-way flow; it is the wrong shape here.
 
-Kept in the code and configurable, defaulted to 1. Two unit tests pin the tier
-behaviour (inner is tighter and smaller; tiers share one position limit) so the
-option cannot rot.
+**The code was later removed.** It shipped defaulted off, and a configuration
+path that is off, measured worse and never asked for is cost without benefit --
+the finding above is worth keeping, the second code path is not. The same applies
+to the fast-volatility horizon further below.
 
 ### Measurement campaign: is the quoter actually profitable?
 
@@ -1507,9 +1526,55 @@ The honest caveat: the hedger's thresholds *were* tuned against this flow profil
 and the widening tail says they are not free of it. A quoter earning real spread
 would want them re-measured, and `tools/sweep.sh` is there for it.
 
-### Tooling written along the way
+### The overnight sweep, and compacting the seats
 
-Everything runs in containers -- no Go toolchain, `nats-py` or venv needed on the
+**The sweep.** `sweeps/overnight.txt` is the properly-powered comparison every
+tuning decision here needed and none of them got: 8 configurations x 7 runs x
+240s, about 4.5 hours, appending to `runs/sweep-<timestamp>.csv` with per-config
+95% intervals as it goes, so it can be stopped early and still read. It covers the
+choices that were made on 3-5 runs and are therefore judgements rather than
+results: taker mode, hedge threshold either side of the shipped 20, quoter
+position cap, edge cap, the pull guard, and two-contract quoting.
+
+`-r 21` is the figure the tooling gives for resolving an effect of 1,000 against a
+stdev of ~5,500; `-r 7` is the indicative version that fits in an evening. Neither
+was run to completion inside this project, and no default should move until one is.
+
+**Compaction.** The three seats went from 2,231 lines to 1,987, with behaviour
+unchanged (verified live: same fills, same desk exposure, zero rejects, full suite
+green). Two features came out entirely -- two-tier quoting and the fast-volatility
+horizon. Both were my own speculative additions, both shipped defaulted off after
+measuring worse, and a code path that is off, unhelpful and unasked-for is cost
+without benefit. The findings that produced them are kept here; the second code
+paths are not.
+
+The rest was prose. The comments carried whole paragraphs of argument that belong
+in this file: the code now states the conclusion and the one fact that makes it
+non-obvious ("Not duplicates: E when we were resting, T when we crossed"), and
+leaves the reasoning here. What survived is what a reader needs to not
+reintroduce a bug.
+
+### A note on what is in this submission
+
+The measurement tooling and the test suite described throughout this file were
+written and used, but are **not included in this submission** -- omitted
+deliberately to keep it to the desk itself and the record of how it was built.
+Every number quoted here came out of them.
+
+They were: a market watcher, a benchmark harness, a repeated-run campaign runner
+with confidence intervals, a markout analyser (adverse selection per fill, split
+into edge captured and drift), a counterparty attribution probe, a leading-signal
+probe, a run summariser, an unattended sweep driver, and a transcript exporter --
+plus 61 tests across four layers, including protocol assertions that pin the
+exchange behaviours this desk depends on and which the shipped documentation gets
+wrong. They can be supplied on request.
+
+`run.sh` calls the run summariser if it is present and carries on silently if it
+is not, so the desk runs unchanged without them.
+
+### Tooling written along the way (not included -- see above)
+
+Everything ran in containers -- no Go toolchain, `nats-py` or venv needed on the
 host.
 
 | tool | what it is for |
@@ -1542,6 +1607,187 @@ Developing on Apple Silicon (arm64); the exchange image is `linux/amd64` and run
 emulated, so local latency numbers are not representative. Grading runs amd64
 natively. Anything I conclude about *timing* here needs re-checking before I trust it.
 
+
+
+## Session 9 — the overnight sweep, a real bug, and a regression that was not there
+
+The sweep I had been deferring all project finally ran: 8 configurations x 7
+repeats x 240s, 56 runs, ~4.5 hours (`tools/sweep.sh sweeps/overnight.txt -d 240
+-r 7`, output `runs/sweep-20260820-205649.csv`). This is the first measurement in
+the whole file with enough repeats to say anything, and it did two things: it
+overturned my largest claim, and it exposed a bug I had introduced myself.
+
+| configuration | mean desk | stdev | 95% CI |
+|---|---|---|---|
+| quoter-maxpos-20 | -18,986 | 3,517 | [-21,645, -16,327] |
+| pull-on-lead | -18,309 | 5,790 | [-22,685, -13,932] |
+| hedge-thresh-30 | -23,898 | 8,699 | [-30,474, -17,323] |
+| taker-reversion | -23,427 | 25,018 | [-42,339, -4,515] |
+| two-contracts | -25,329 | 15,818 | [-37,287, -13,372] |
+| edge-cap-20 | -25,593 | 7,897 | [-31,562, -19,623] |
+| shipped | -25,886 | 11,791 | [-34,799, -16,973] |
+| hedge-thresh-12 | -39,994 | 18,878 | [-54,265, -25,723] |
+
+**I retract the reversion result.** Sessions earlier I called `TAKER_MODE=reversion`
+the largest single effect in the project, worth about 29,000, on four runs (+7,544,
++7,199, +4,576, -1,938). At n=7 it is -23,427 with a standard deviation of 25,018 --
+an interval from -42,339 to -4,515 that contains `shipped` entirely. Reversion is not
+better here; it is *high-variance*, and a four-run sample renders high variance as a
+large effect. This is the same error as the other two retractions, made a third time
+with more runs behind it, which is exactly why I had wanted the sweep. The desk ships
+`momentum` and now does so for a defensible reason rather than the cautious one.
+
+`hedge-thresh-12` at -39,994 does clear `shipped`, replicating the earlier finding
+that a tight threshold makes the hedger churn against its own flow. That supports the
+shipped 20. Nothing else in the table separates.
+
+### The compaction regression
+
+Every row was ~11,000 worse than the -14,969 +/- 308 I had measured before compacting
+the seats. That gap was the only thing in the table I could not explain by noise, so I
+A/B'd it: a copy of the repo checked out at HEAD (pre-compaction) against the working
+tree, alternating runs so machine drift hit both equally.
+
+| | desk | quoter line |
+|---|---|---|
+| pre-compaction | -15,150 / -10,952 / -10,006 -> **-12,036** | -> **-5,210** |
+| compacted | -16,832 / -19,760 / -20,796 -> **-19,129** | -> **-11,471** |
+
+No overlap across six runs, and the damage is in the quoter line. The compaction had
+removed two genuinely dead features (`QUOTER_TIERS`, default 1; `QUOTER_FAST_VOL_MS`,
+default 0 -- neither set by compose, so both provably inert). But it had *also* deleted
+three lines from the config literal:
+
+```go
+UseRef:     envInt("QUOTER_USE_REF", 1) != 0,
+BasisAlpha: envFloat("QUOTER_BASIS_ALPHA", 0.05),
+RefStale:   time.Duration(envInt("QUOTER_REF_STALE_MS", 2000)) * time.Millisecond,
+```
+
+while leaving every *reader* of those fields intact. So `cfg.UseRef` took Go's zero
+value, `fairValue()` returned early on `!q.cfg.UseRef`, and the quoter stopped pricing
+off the lead contract -- it went back to quoting a quiet month off its own thin mid,
+which is the exact failure the reference-pricing work existed to fix.
+
+**And then the whole regression evaporated.** I wrote "cost: ~6,300 a run" into this
+file before measuring the fix -- precisely the error the rest of these notes are about,
+committed while writing the entry about committing it. Restoring the assignments gave
+-18,205, -24,345, -20,778 (mean -21,109), no better than the broken build. So I ran the
+comparison again, interleaved, HEAD against the fixed build:
+
+| pair | pre-compaction | fixed | difference |
+|---|---|---|---|
+| 1 | -16,234 | -5,529 | **+10,705** |
+| 2 | -11,849 | -22,679 | **-10,830** |
+| 3 | -14,563 | -14,715 | -152 |
+| mean | **-14,215** | **-14,308** | -93 |
+
+The differences cancel. Pooling all twelve runs: pre-compaction -13,126 +/- 2,526,
+current build -17,708 +/- 6,866, overlapping, t ~ 1.5. **There is no compaction
+regression.** The first A/B separated cleanly across six alternating runs and it was
+noise that happened to line up.
+
+**This is the fourth time, and the worst one.** The first three retractions came from
+small samples I had not thought hard about. This one came from a comparison I designed
+specifically to be trustworthy -- interleaved so machine drift hit both arms equally,
+six runs, no overlap between the arms, the damage localised to the quoter line exactly
+where a quoter bug should show. It looked like the cleanest measurement in the file. The
+thing I still had not internalised is that *interleaving controls for drift, not for
+variance*: at a per-run standard deviation near 5,000, three runs an arm cannot resolve
+5,000, and "no overlap" across six samples from the same distribution is an ordinary
+coincidence rather than evidence. The arithmetic for how many runs that needs is written
+in this file two sessions above, by me, and I did not apply it to my own test.
+
+**Why nothing caught it.** It compiled -- an unset struct field is not an error in Go,
+it is a zero value. `go vet` was clean. All 29 unit tests passed, because every one of
+them builds a `Config` literal by hand and none had ever exercised `loadConfig()`, the
+path the container actually takes. The README still documented `QUOTER_USE_REF` with a
+default of 1. Every artefact I would normally trust agreed the code was fine, and the
+only thing that disagreed was a number in a sweep I nearly did not run.
+
+Two tests now cover it, and I checked both fail when the assignment is deleted again
+rather than assuming they would:
+
+- `TestConfigFromEnv` -- builds config through the env path with `QUOTER_*` cleared and
+  asserts the defaults a bare container gets, `UseRef` among them.
+- `TestDocumentedVarsAreRead` -- every `QUOTER_*` in `strategy/README.md` must appear in
+  `main.go`. Documentation drift becomes a failing test.
+
+**What this costs the sweep.** All 56 runs used the broken build, so the table above
+measures a quoter with reference pricing off. The *relative* comparisons survive (every
+row shares the defect) -- the reversion retraction and the `hedge-thresh-12` result both
+stand, since neither depends on ref pricing. The absolute levels do not, and
+`pull-on-lead` is the row to distrust most: whatever it was measuring, it was not the
+lead-following behaviour its name claims. I am not re-running 4.5 hours to restate it.
+
+### Why restoring it changed nothing: the lead-detection bug
+
+The null result had a cause, and finding it is the one piece of real progress in this
+session. I made the quoter log which contract it is pricing off (`ref=` in the status
+line, `useref=` at startup) -- state that had never been observable, which is how it sat
+switched off for a whole sweep without anyone noticing. On a clean checkout the shipped
+desk reports `ref=own` for every second of the run: the quoter believes *it* is the lead
+contract, so `fairValue()` returns its own mid and reference pricing is a no-op.
+
+It is wrong about that, and the reason is self-inflicted. The lead is chosen by counting
+BBO updates per feed, and **our own quoting generates BBO updates on our own feed**.
+Measured with the market running and no desk attached:
+
+```
+4338 AAH6      <- the real lead
+3897 AAM6      <- what we quote
+2442 AAU6
+```
+
+AAH6 leads by 11%. Our requoting adds far more than 11% to AAM6's count, so we out-tick
+the contract we are supposed to be following and disqualify it under the "unless that is
+us" guard. The clean-checkout log catches the moment it happens: the first two status
+lines read `ref=AAH6+15` -- it found the lead and learned a basis of 15 -- and every one
+of the 160 lines after that reads `ref=own`, because by then we are quoting. The
+machinery works exactly as designed; it is the ranking feeding it that is wrong -- a guard written to stop us importing lag, which instead guarantees we always
+do. Reference pricing has therefore been inert in every full-desk measurement in this
+file, including the ones where I concluded it helped.
+
+**I am not fixing it here.** The fix is clear enough -- measure activity in something we
+do not ourselves produce, counterparty trades rather than book churn -- but it is a
+behavioural change to the pricing core, and this market's run-to-run noise (stdev ~5,000
+on a desk total of similar size) cannot resolve its effect in the runs I have left. This
+session already contains two retractions caused by shipping on evidence that thin. It is
+written down as the first thing to do with more time, with the measurement that proves
+it, which is worth more than a change I would have to describe as unvalidated.
+
+### Clean-checkout verification
+
+Pristine `git archive 657d59d` (the repo exactly as provided, 18 files), the submission's
+18 files overlaid, `./run.sh --sim --strategy`, nothing else present -- no `tools/`, no
+`tests/`, no `sweeps/`:
+
+- all six containers up; quoter, taker and hedger all trading
+- **0** rejects, errors or tracebacks across all three seats
+- desk exposure over 162 samples: mean 7.5, median 7, p95 17, max 22, **0%** at or above 25
+- the two references to omitted tooling are inert: `run.sh` guards its call with
+  `[ -x ./tools/run_summary.sh ] && ... || true`, and the `docker-compose.yml` mention is
+  inside a comment
+
+**What survives.** The compaction stands: the code reads better and measures the same,
+which was the point of it. The deleted config was a genuine defect -- `UseRef` really
+was false, `fairValue()` really did stop consulting the lead contract, and that is a fact
+about the code rather than a claim about a number, so the restoration and its two tests
+stay in regardless of what the benchmarks say about them. What does *not* survive is any
+statement about what it cost.
+
+The sweep's `shipped` row (-25,886) still sits below what `bench.sh` measures for the
+same configuration (-17,708). Those are different harnesses -- `sweep.sh` drives the
+seats with `docker run`, `bench.sh` through compose -- and the intervals nearly touch, so
+it is either a harness difference or more of the same variance. I am not spending another
+four hours to find out which; it is recorded as unexplained, which is what it is.
+
+**The lesson, and it is the one this whole file keeps teaching.** The last three
+sessions I have been rewarded for distrusting agreeable numbers. Here the numbers were
+*disagreeable* and I nearly explained them away as a harness difference -- I had already
+written that hypothesis down. What separated "different harness" from "I broke
+something" was six controlled runs costing 30 minutes, against a bug that had been
+costing 6,300 a run since the moment I tidied the code.
 
 ###
 

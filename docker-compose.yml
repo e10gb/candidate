@@ -87,11 +87,9 @@ services:
       QUOTER_EDGE_VOL: ${QUOTER_EDGE_VOL:-}
       QUOTER_MAX_EDGE: ${QUOTER_MAX_EDGE:-40}
       QUOTER_VOL_WINDOW_MS: ${QUOTER_VOL_WINDOW_MS:-}
-      QUOTER_FAST_VOL_MS: ${QUOTER_FAST_VOL_MS:-}
       QUOTER_PULL_MOVE: ${QUOTER_PULL_MOVE:-}
       QUOTER_PULL_MS: ${QUOTER_PULL_MS:-}
       QUOTER_USE_REF: ${QUOTER_USE_REF:-}
-      QUOTER_TIERS: ${QUOTER_TIERS:-}
       QUOTER_CLIP: ${QUOTER_CLIP:-}
       # Inventory the quoter may carry, and the exposure the hedger tolerates
       # before acting. These two set the desk's hedging bill between them: the
