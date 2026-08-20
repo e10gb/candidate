@@ -43,7 +43,7 @@ func TestParseReply(t *testing.T) {
 // must never repeat -- including across a container restart, which is why it is
 // seeded from the clock.
 func TestOrderIDsAreUniqueAndEightChars(t *testing.T) {
-	c := newClient(nil, "QUOTE001", "AAH6", 20, 8)
+	c := newClient(nil, "QUOTE001", "AAH6", 20, 8, newIDs())
 	seen := make(map[string]bool, 10000)
 	for i := 0; i < 10000; i++ {
 		id := c.newOrderID()
@@ -61,7 +61,7 @@ func TestOrderIDsAreUniqueAndEightChars(t *testing.T) {
 // requests, and forcing them 1/rate apart left us on stale quotes for ~200ms.
 func TestTokenBucketAllowsABurstThenThrottles(t *testing.T) {
 	burst := 8
-	c := newClient(nil, "QUOTE001", "AAH6", 20, burst)
+	c := newClient(nil, "QUOTE001", "AAH6", 20, burst, newIDs())
 
 	for i := 0; i < burst; i++ {
 		if w := c.reserve(); w != 0 {
@@ -78,7 +78,7 @@ func TestTokenBucketAllowsABurstThenThrottles(t *testing.T) {
 }
 
 func TestTokenBucketRefills(t *testing.T) {
-	c := newClient(nil, "QUOTE001", "AAH6", 100, 2) // refills every 10ms
+	c := newClient(nil, "QUOTE001", "AAH6", 100, 2, newIDs()) // refills every 10ms
 	c.reserve()
 	c.reserve()
 	if c.reserve() == 0 {
@@ -91,7 +91,7 @@ func TestTokenBucketRefills(t *testing.T) {
 }
 
 func TestUnlimitedWhenRateIsZero(t *testing.T) {
-	c := newClient(nil, "QUOTE001", "AAH6", 0, 0)
+	c := newClient(nil, "QUOTE001", "AAH6", 0, 0, newIDs())
 	for i := 0; i < 100; i++ {
 		if w := c.reserve(); w != 0 {
 			t.Fatalf("maxTPS=0 means unlimited, got a wait of %v", w)
@@ -151,5 +151,26 @@ func TestApplyMetaClampsPositionLimit(t *testing.T) {
 	applyMeta(&cfg, meta{tickSize: 1, positionLimit: 10})
 	if cfg.MaxPos != 10 {
 		t.Errorf("MaxPos should clamp to the exchange limit 10, got %d", cfg.MaxPos)
+	}
+}
+
+// Ids are consumed per *sender*, not per contract, so a quoter running several
+// books must draw from one sequence. Two allocators seeded from the wall clock
+// would start within a millisecond of each other and collide -- silently, as a
+// 203 on an order that simply never rests.
+func TestClientsOnDifferentFeedsShareOneIDSequence(t *testing.T) {
+	g := newIDs()
+	a := newClient(nil, "QUOTE001", "AAM6", 20, 8, g)
+	b := newClient(nil, "QUOTE001", "AAU6", 20, 8, g)
+
+	seen := make(map[string]bool, 2000)
+	for i := 0; i < 1000; i++ {
+		for _, c := range []*client{a, b} {
+			id := c.newOrderID()
+			if seen[id] {
+				t.Fatalf("id %q issued twice across contracts", id)
+			}
+			seen[id] = true
+		}
 	}
 }

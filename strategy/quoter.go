@@ -54,6 +54,14 @@ type quoter struct {
 	// actually moving. Trimmed to cfg.VolWindow on every push.
 	mids []midSample
 
+	// While set, we are out of the market entirely: a move large enough to be
+	// informed just happened and quoting into it is how we get picked off.
+	pullUntil time.Time
+	// Recent reference-contract mids. The lead moves before our book does, so a
+	// move here is advance warning; our own mid moving is not -- by then the
+	// repricing orders have already crossed us.
+	refMids []midSample
+
 	// A reference instrument that leads ours, if configured. Our own book can be
 	// stale: a correlated contract that moves first tells us where fair value has
 	// gone before our own top of book catches up, which is the difference between
@@ -80,11 +88,11 @@ type quoter struct {
 	wake    chan struct{} // coalescing signal: capacity 1
 }
 
-func newQuoter(nc *nats.Conn, cfg config) *quoter {
+func newQuoter(nc *nats.Conn, cfg config, g *ids) *quoter {
 	return &quoter{
 		cfg:   cfg,
 		nc:    nc,
-		cl:    newClient(nc, cfg.Sender, cfg.Feed, cfg.MaxTPS, cfg.MaxBurst),
+		cl:    newClient(nc, cfg.Sender, cfg.Feed, cfg.MaxTPS, cfg.MaxBurst, g),
 		wake:  make(chan struct{}, 1),
 		bids:  make([]resting, cfg.Tiers),
 		asks:  make([]resting, cfg.Tiers),
@@ -121,6 +129,7 @@ func (q *quoter) onBBO(m *nats.Msg) {
 		q.lastMark = mid
 		q.haveMark = true
 		q.pushMid(mid)
+		q.checkPull(mid)
 	}
 	q.mu.Unlock()
 
@@ -190,6 +199,7 @@ func (q *quoter) onRefBBO(m *nats.Msg) {
 
 	q.mu.Lock()
 	q.refMid, q.refOK, q.refAt = rm, true, time.Now()
+	q.checkPullRef(rm)
 	if q.bidOK && q.askOK {
 		obs := float64(q.bidPx+q.askPx)/2 - rm
 		if !q.basisSet {
@@ -351,6 +361,31 @@ func (q *quoter) pushMid(mid float64) {
 	}
 }
 
+// volatilityOver is the standard deviation of the mid over the most recent
+// `window`, in price units. Caller must hold q.mu.
+func (q *quoter) volatilityOver(window time.Duration) float64 {
+	cut := time.Now().Add(-window)
+	i := 0
+	for i < len(q.mids) && q.mids[i].at.Before(cut) {
+		i++
+	}
+	seg := q.mids[i:]
+	if len(seg) < 3 {
+		return 0
+	}
+	var sum float64
+	for _, s := range seg {
+		sum += s.mid
+	}
+	mean := sum / float64(len(seg))
+	var sq float64
+	for _, s := range seg {
+		d := s.mid - mean
+		sq += d * d
+	}
+	return math.Sqrt(sq / float64(len(seg)))
+}
+
 // volatility is the standard deviation of the mid over the recent window, in
 // price units. Caller must hold q.mu.
 //
@@ -378,6 +413,84 @@ func (q *quoter) volatility() float64 {
 	return math.Sqrt(sq / float64(len(q.mids)))
 }
 
+// checkPullRef is the same guard driven by the *leading* contract, which is the
+// point of it: the measured failure is background quoters repricing off the front
+// month and crossing our resting quotes as the mid passes through them, at which
+// instant we capture no spread at all (measured edge at fill: -0.78 to +1.05 per
+// lot, whatever width we quote). Our own mid moving is not a warning -- by then
+// those orders have already traded with us. The lead moving is.
+// Caller must hold q.mu.
+func (q *quoter) checkPullRef(mid float64) {
+	if q.cfg.PullMove <= 0 {
+		return
+	}
+	now := time.Now()
+	q.refMids = append(q.refMids, midSample{at: now, mid: mid})
+	cut := now.Add(-q.cfg.PullWindow)
+	i := 0
+	for i < len(q.refMids) && q.refMids[i].at.Before(cut) {
+		i++
+	}
+	if i > 0 {
+		q.refMids = append(q.refMids[:0], q.refMids[i:]...)
+	}
+	// Same rule as checkPull: without a sample a full window old we cannot judge
+	// a move over that window, and guessing from a much older one re-triggers
+	// the pull indefinitely.
+	var ref float64
+	found := false
+	for _, s := range q.refMids {
+		if s.at.After(cut) {
+			break
+		}
+		ref, found = s.mid, true
+	}
+	if !found {
+		return
+	}
+	if math.Abs(mid-ref) >= q.cfg.PullMove {
+		q.pullUntil = now.Add(q.cfg.PullFor)
+	}
+}
+
+// checkPull takes us out of the market when the price has just moved sharply.
+// Caller must hold q.mu.
+//
+// Measured markout says the damage is a transient: -7.15 per lot at 100ms after a
+// fill, recovering by 500ms. The obvious response -- widen when the market moves --
+// was tried and measured *worse* (-6.98 to -16.74), and the reason is mechanical:
+// widening changes our target price, so reconcile cancels and re-adds, and the
+// re-add puts a brand new order into the middle of the move. Pulling has no such
+// failure mode. We cancel and stay out; there is nothing left to hit.
+//
+// The distinction is the whole point of this: it is not "quote further away", it
+// is "do not be in the book at all for the moment it takes the move to land".
+func (q *quoter) checkPull(mid float64) {
+	if q.cfg.PullMove <= 0 || len(q.mids) < 2 {
+		return
+	}
+	// The reference is the mid as it was one PullWindow ago. If no sample is that
+	// old we cannot measure a move over the window and must not guess: falling
+	// back to the oldest sample in the buffer (up to VolWindow, 10x longer) would
+	// compare against a far older price, read a much larger "move" than really
+	// occurred, and re-trigger the pull indefinitely.
+	cut := time.Now().Add(-q.cfg.PullWindow)
+	var ref float64
+	found := false
+	for _, s := range q.mids {
+		if s.at.After(cut) {
+			break
+		}
+		ref, found = s.mid, true
+	}
+	if !found {
+		return
+	}
+	if move := math.Abs(mid - ref); move >= q.cfg.PullMove {
+		q.pullUntil = time.Now().Add(q.cfg.PullFor)
+	}
+}
+
 // edge returns the half-spread to quote, in price units. Caller must hold q.mu.
 //
 // The cap matters more than it sounds. Volatility is sampled at the moments we
@@ -392,7 +505,22 @@ func (q *quoter) volatility() float64 {
 func (q *quoter) edge() float64 {
 	e := q.cfg.EdgeTicks // floor: never quote tighter than this
 	if q.cfg.EdgeVolMult > 0 {
-		if v := q.cfg.EdgeVolMult * q.volatility(); v > e {
+		// Two horizons, widest wins. The slow one sets the baseline; the fast one
+		// is what catches a move in progress.
+		//
+		// Measured markout showed the damage is a sharp transient: -7.15 per lot
+		// 100ms after a fill, recovering to -0.49 by 500ms. A 2s volatility window
+		// cannot see a 100ms event, so the edge stayed narrow through exactly the
+		// moment it needed to be wide -- the background quoters reprice off the
+		// front month and sweep through our stale quotes before the slow estimate
+		// has moved at all.
+		v := q.volatility()
+		if q.cfg.FastVolWindow > 0 {
+			if fast := q.volatilityOver(q.cfg.FastVolWindow); fast > v {
+				v = fast
+			}
+		}
+		if v *= q.cfg.EdgeVolMult; v > e {
 			e = v
 		}
 	}
@@ -433,6 +561,9 @@ func (q *quoter) desired() (bids, asks []target, ok bool) {
 
 	if !q.bidOK || !q.askOK || q.askPx <= q.bidPx {
 		return nil, nil, false // one-sided or crossed: no fair value
+	}
+	if time.Now().Before(q.pullUntil) {
+		return nil, nil, false // a sharp move just landed: be out of the book
 	}
 
 	fair := q.fairValue()
@@ -701,9 +832,9 @@ func (q *quoter) status() string {
 	if px, lok := q.liqPrice(); lok {
 		liq = fmt.Sprintf("%.0f", float64(q.cash)+float64(q.position)*px)
 	}
-	return fmt.Sprintf("pos=%d cash=%d pnl=%s liq=%s fills=%d bid=%s ask=%s",
-		q.position, q.cash, pnl, liq, q.fills, fmtQuote(best(q.bids, true)),
-		fmtQuote(best(q.asks, false)))
+	return fmt.Sprintf("%s pos=%d cash=%d pnl=%s liq=%s fills=%d bid=%s ask=%s",
+		q.cfg.Feed, q.position, q.cash, pnl, liq, q.fills,
+		fmtQuote(best(q.bids, true)), fmtQuote(best(q.asks, false)))
 }
 
 // best returns the tightest live quote on a side: the highest bid, the lowest

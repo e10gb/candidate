@@ -12,19 +12,23 @@ import (
 
 func testCfg() config {
 	return config{
-		Sender:       "QUOTE001",
-		Tiers:        1, // single tier unless a test opts in
-		Feed:         "AAH6",
-		Clip:         5,
-		MaxPos:       25,
-		EdgeTicks:    2,
-		SkewFrac:     1.0,
-		MinEdgeTicks: 1,
-		EdgeVolMult:  0, // fixed edge unless a test opts in
-		MaxEdgeTicks: 120,
-		VolWindow:    2 * time.Second,
-		MaxTPS:       20,
-		MaxBurst:     8,
+		Sender:        "QUOTE001",
+		Tiers:         1, // single tier unless a test opts in
+		Feed:          "AAH6",
+		Clip:          5,
+		MaxPos:        25,
+		EdgeTicks:     2,
+		SkewFrac:      1.0,
+		MinEdgeTicks:  1,
+		EdgeVolMult:   0, // fixed edge unless a test opts in
+		MaxEdgeTicks:  120,
+		VolWindow:     2 * time.Second,
+		FastVolWindow: 0, // off unless a test opts in
+		PullMove:      0, // off unless a test opts in
+		PullWindow:    200 * time.Millisecond,
+		PullFor:       300 * time.Millisecond,
+		MaxTPS:        20,
+		MaxBurst:      8,
 	}
 }
 
@@ -37,7 +41,7 @@ func outer(bids, asks []target) (target, target) {
 // newTestQuoter builds a quoter with a known book and no network.
 func newTestQuoter(t *testing.T, cfg config, bid, ask int) *quoter {
 	t.Helper()
-	q := newQuoter(nil, cfg)
+	q := newQuoter(nil, cfg, newIDs())
 	q.bidPx, q.bidOK = bid, true
 	q.askPx, q.askOK = ask, true
 	return q
@@ -303,6 +307,52 @@ func TestStaleLeadIsIgnored(t *testing.T) {
 	}
 }
 
+// Pulling, not widening. Widening changes the target price, so reconcile cancels
+// and re-adds -- and the re-add drops a fresh order into the middle of the move,
+// which measured worse than doing nothing. Pulling leaves the book empty of our
+// orders until the move has landed.
+func TestSharpMovePullsUsOutOfTheMarket(t *testing.T) {
+	cfg := testCfg()
+	cfg.PullMove = 20
+	// Short windows so the test can create real elapsed time. A move is judged
+	// against the mid one PullWindow ago, so the history has to actually be that
+	// old -- pushing every sample in the same microsecond measures nothing.
+	cfg.PullWindow = 50 * time.Millisecond
+	cfg.PullFor = 200 * time.Millisecond
+	q := newTestQuoter(t, cfg, 995, 1005)
+
+	// A calm book quotes normally.
+	q.onBBO(&nats.Msg{Data: []byte("1 AAM6 995 5 1005 5")})
+	if _, _, ok := q.desired(); !ok {
+		t.Fatal("a calm market should be quoted")
+	}
+	time.Sleep(cfg.PullWindow + 30*time.Millisecond)
+
+	// A 40-point jump against that reference: out of the market.
+	q.onBBO(&nats.Msg{Data: []byte("2 AAM6 1035 5 1045 5")})
+	if _, _, ok := q.desired(); ok {
+		t.Error("a sharp move should pull us out, not merely widen us")
+	}
+
+	// And back in once it has passed and the market has settled.
+	time.Sleep(cfg.PullFor + 50*time.Millisecond)
+	q.onBBO(&nats.Msg{Data: []byte("3 AAM6 1036 5 1046 5")})
+	if _, _, ok := q.desired(); !ok {
+		t.Error("should return to the market once the move has landed")
+	}
+}
+
+func TestPullIsOffByDefault(t *testing.T) {
+	cfg := testCfg() // PullMove 0
+	q := newTestQuoter(t, cfg, 995, 1005)
+	q.onBBO(&nats.Msg{Data: []byte("1 AAM6 995 5 1005 5")})
+	time.Sleep(cfg.PullWindow + 30*time.Millisecond)
+	q.onBBO(&nats.Msg{Data: []byte("2 AAM6 1195 5 1205 5")}) // huge jump
+	if _, _, ok := q.desired(); !ok {
+		t.Error("with PullMove unset a move must not stop us quoting")
+	}
+}
+
 func TestNoQuoteWithoutTwoSidedBook(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -364,6 +414,47 @@ func TestEdgeScalesWithVolatility(t *testing.T) {
 	}
 	if wild > cfg.MaxEdgeTicks {
 		t.Errorf("edge %.1f exceeded the cap %.0f", wild, cfg.MaxEdgeTicks)
+	}
+}
+
+// A burst inside the fast window must widen the edge even while the slow window
+// still reads calm -- that gap is where the picking-off happened: measured -7.15
+// per lot at 100ms after a fill against -0.49 by 500ms.
+func TestFastVolatilityCatchesABurstTheSlowWindowMisses(t *testing.T) {
+	cfg := testCfg()
+	cfg.EdgeVolMult = 4
+	cfg.VolWindow = 10 * time.Second
+	cfg.FastVolWindow = 200 * time.Millisecond
+	cfg.MaxEdgeTicks = 0
+	q := newTestQuoter(t, cfg, 995, 1005)
+
+	// A long calm history, then a real pause so it falls *outside* the fast
+	// window -- otherwise both horizons see the same samples and the test proves
+	// nothing (which is exactly what it did first time round).
+	q.mu.Lock()
+	for i := 0; i < 200; i++ {
+		q.pushMid(1000)
+	}
+	slowOnly := q.cfg.EdgeVolMult * q.volatility()
+	q.mu.Unlock()
+	time.Sleep(cfg.FastVolWindow + 50*time.Millisecond)
+
+	// Then a burst, entirely inside the fast window.
+	q.mu.Lock()
+	for _, m := range []float64{1000, 1040, 960, 1050} {
+		q.pushMid(m)
+	}
+	fast := q.volatilityOver(cfg.FastVolWindow)
+	slow := q.volatility()
+	edge := q.edge()
+	q.mu.Unlock()
+
+	if fast <= slow {
+		t.Errorf("the burst should read louder on the fast window: fast %.1f, slow %.1f",
+			fast, slow)
+	}
+	if edge <= slowOnly {
+		t.Errorf("edge should widen on the fast reading (%.1f), got %.1f", fast, edge)
 	}
 }
 

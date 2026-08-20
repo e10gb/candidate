@@ -92,8 +92,40 @@ func (r reply) String() string {
 	return fmt.Sprintf("N %d %s", r.code, r.text)
 }
 
-// client owns order entry for one sender: id generation, self-imposed rate
-// limiting, and reply parsing.
+// ids allocates order ids for one sender across every contract it trades.
+//
+// Shared deliberately: ids are consumed permanently *per sender*, not per feed,
+// so a quoter running several contracts must draw from one sequence. Two clients
+// each seeding from the wall clock would start within a millisecond of each other
+// and collide immediately -- and the collision is a silent 203, not a crash.
+type ids struct {
+	mu   sync.Mutex
+	next uint64
+}
+
+// newIDs seeds from the clock so a container restart resumes above everything the
+// previous run burned. Milliseconds since epoch (~1.8e12) fits inside the
+// 36^8 (~2.8e12) the protocol's 8 characters allow, good until ~2059.
+func newIDs() *ids {
+	return &ids{next: uint64(time.Now().UnixMilli())}
+}
+
+// next8 returns a fresh 8-char id. Monotonic, never recycled.
+func (g *ids) next8() string {
+	g.mu.Lock()
+	n := g.next
+	g.next++
+	g.mu.Unlock()
+	var b [8]byte
+	for i := 7; i >= 0; i-- {
+		b[i] = base36[n%36]
+		n /= 36
+	}
+	return string(b[:])
+}
+
+// client owns order entry for one sender on one contract: rate limiting and
+// reply parsing. Order ids come from a sender-wide allocator it does not own.
 type client struct {
 	nc     *nats.Conn
 	sender string
@@ -101,8 +133,8 @@ type client struct {
 	subj   string // ex.req.<sender> -- the exchange listens on ex.req.>, and a
 	// request to bare "ex.req" silently gets no responders (the bug in taker.py).
 
-	mu     sync.Mutex
-	nextID uint64
+	mu  sync.Mutex
+	ids *ids
 
 	// Token bucket, not fixed spacing between requests. Repricing both sides is
 	// cancel+add twice, and with a fixed 1/maxTPS gap that serialised into ~200ms
@@ -116,20 +148,15 @@ type client struct {
 	last   time.Time
 }
 
-func newClient(nc *nats.Conn, sender, feed string, maxTPS, maxBurst int) *client {
+func newClient(nc *nats.Conn, sender, feed string, maxTPS, maxBurst int, g *ids) *client {
 	return &client{
+		ids:    g,
 		nc:     nc,
 		sender: sender,
 		feed:   feed,
 		subj:   "ex.req." + sender,
 		rate:   float64(maxTPS),
 		burst:  float64(maxBurst),
-		// Order ids are consumed permanently per sender -- cancelling does not
-		// free them (reject 203). Seeding from the wall clock means a container
-		// restart resumes above every id the previous run burned. Milliseconds
-		// since epoch is ~1.8e12, comfortably inside the 36^8 = 2.8e12 that fits
-		// in the protocol's 8 characters (good until ~2059).
-		nextID: uint64(time.Now().UnixMilli()),
 		tokens: float64(maxBurst), // start full: the first reposition should not wait
 	}
 }
@@ -161,17 +188,7 @@ func (c *client) reserve() time.Duration {
 
 const base36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
-// newOrderID returns a fresh 8-char id. Monotonic, never recycled.
-func (c *client) newOrderID() string {
-	c.nextID++
-	n := c.nextID
-	var b [8]byte
-	for i := 7; i >= 0; i-- {
-		b[i] = base36[n%36]
-		n /= 36
-	}
-	return string(b[:])
-}
+func (c *client) newOrderID() string { return c.ids.next8() }
 
 // request rate-limits, sends, and parses. Exceeding the exchange's per-feed
 // max_tps disconnects the sender outright (changelog v2.3) rather than merely

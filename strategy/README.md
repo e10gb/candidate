@@ -46,18 +46,25 @@ tried and rejected.
 ## Configuration
 
 All optional; defaults in brackets. Empty values are treated as unset.
+> **The shipped desk overrides some of these.** The table below is the code's
+> own defaults, which apply when a variable is unset. `docker-compose.yml`
+> sets several of them for the desk as configured, with the measurements
+> that justify each in comments beside them. Where the two differ, compose
+> wins at runtime.
+
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `NATS_URL` | `nats://127.0.0.1:4222` | exchange connection |
 | `SENDER` | `QUOTE001` | our 8-char sender id |
-| `QUOTER_FEED` | `$TAKER_FEED`, else `AAH6` | contract to quote |
+| `QUOTER_FEED` | `$TAKER_FEED`, else `AAH6` (compose: `AAM6`) | contract(s) to quote; comma-separated for several, e.g. `AAM6,AAU6` |
 | `QUOTER_CLIP` | `5` | size per quote |
-| `QUOTER_MAX_POS` | `25` | max absolute position (clamped by `position_limit`) |
+| `QUOTER_MAX_POS` | `25` (compose: `10`) | max absolute position (clamped by `position_limit`) |
 | `QUOTER_EDGE` | `2` | floor on the half-spread |
 | `QUOTER_EDGE_VOL` | `4.0` | edge as a multiple of measured volatility; `0` = fixed edge |
-| `QUOTER_MAX_EDGE` | `20` | absolute cap on the edge (compose ships `40`) |
+| `QUOTER_MAX_EDGE` | `20` (compose: `40`) | absolute cap on the edge |
 | `QUOTER_VOL_WINDOW_MS` | `2000` | volatility measurement window |
+| `QUOTER_FAST_VOL_MS` | `0` (off) | second, shorter volatility horizon; the edge takes whichever is wider. Trialled at 250 and measured worse -- widening mid-burst forces a cancel-replace that posts a fresh order into the moving market |
 | `QUOTER_SKEW_FRAC` | `1.0` | inventory lean at full position, as a fraction of the edge |
 | `QUOTER_MIN_EDGE` | `1` | margin every quote keeps against fair value |
 | `QUOTER_USE_REF` | `1` | price off the busiest sibling contract; `0` disables |
@@ -66,6 +73,9 @@ All optional; defaults in brackets. Empty values are treated as unset.
 | `QUOTER_TIERS` | `1` | quotes per side; `2` adds a tight inner quote (trialled, measured worse here) |
 | `QUOTER_INNER_EDGE_FRAC` | `0.4` | inner tier's edge, as a fraction of the full edge |
 | `QUOTER_INNER_SIZE_FRAC` | `0.4` | inner tier's size, as a fraction of the clip |
+| `QUOTER_PULL_MOVE` | `0` (off) | leave the book entirely when the price moves this far within `QUOTER_PULL_WINDOW_MS`. Pulling, not widening: widening changes the target price, so reconcile cancels and re-adds, and the re-add posts a fresh order into the move |
+| `QUOTER_PULL_WINDOW_MS` | `200` | window over which that move is measured |
+| `QUOTER_PULL_MS` | `300` | how long to stay out once triggered |
 | `QUOTER_MAX_TPS` | `-1` (auto) | request rate cap; auto derives it from `EX_META` |
 | `QUOTER_MAX_BURST` | `8` | requests allowed back-to-back |
 | `QUOTER_MIN_REQUOTE_MS` | `0` | floor on time between requote cycles |
@@ -79,3 +89,23 @@ Built from source inside the Dockerfile (`CGO_ENABLED=0`, hash-verified against
 docker run --rm -v "$PWD":/w -w /w golang:1.23-alpine go test ./...
 ../tests/run_tests.sh unit          # this plus the Python seats' tests
 ```
+
+## Quoting several contracts
+
+`QUOTER_FEED` accepts a comma-separated list. Each contract gets its own quoter
+with its own book, inventory and position limit; they share only the NATS
+connection and an **order-id allocator**, because ids are consumed per *sender*
+rather than per feed -- two allocators seeded from the wall clock would start
+within a millisecond of each other and collide silently as reject 203.
+
+The hedger needs no change: it already sums exposure across every contract via
+`ex.md.*.<sender>`.
+
+Verified live on `AAM6,AAU6`: both books quoted and filled, the hedger summed the
+two positions correctly, zero 203s.
+
+**It ships quoting one contract.** More books means more independent spread
+capture, but whether it pays here is not established -- run-to-run noise on this
+market is around 5,500 on a desk total of similar size, so it needs a proper
+sweep (`tools/sweep.sh`, ~20 runs per configuration) rather than the two or three
+that would fit in a session. The capability is there; the claim is not made.

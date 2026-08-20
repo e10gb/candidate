@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,6 +35,16 @@ type config struct {
 	EdgeVolMult  float64
 	MaxEdgeTicks float64
 	VolWindow    time.Duration
+	// A second, much shorter volatility horizon. The edge takes whichever is
+	// wider, so a burst widens quotes within FastVolWindow instead of waiting for
+	// the slow window to notice.
+	FastVolWindow time.Duration
+	// Leave the market outright for PullFor after the mid moves PullMove or more
+	// within PullWindow. 0 disables. Pulling rather than widening: widening forces
+	// a cancel-and-replace, which posts a fresh order into the move.
+	PullMove   float64
+	PullWindow time.Duration
+	PullFor    time.Duration
 	// MinEdgeTicks is the margin every quote must keep against fair value, no
 	// matter how much inventory skew wants to give away. Getting flat below this
 	// is the hedger's job.
@@ -91,6 +102,12 @@ func loadConfig() config {
 		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 20),
 		VolWindow: time.Duration(envInt("QUOTER_VOL_WINDOW_MS", 2000)) *
 			time.Millisecond,
+		FastVolWindow: time.Duration(envInt("QUOTER_FAST_VOL_MS", 0)) *
+			time.Millisecond,
+		PullMove: envFloat("QUOTER_PULL_MOVE", 0),
+		PullWindow: time.Duration(envInt("QUOTER_PULL_WINDOW_MS", 200)) *
+			time.Millisecond,
+		PullFor: time.Duration(envInt("QUOTER_PULL_MS", 300)) * time.Millisecond,
 		// Trialled at 2 and measured worse, so it ships off. A tight inner quote
 		// tripled the fill count and halved the realised spread exactly as
 		// intended, but the extra flow was not profitable: the quoter's own PnL did
@@ -148,6 +165,22 @@ func applyMeta(cfg *config, mt meta) {
 	}
 }
 
+// splitFeeds parses a comma-separated contract list. One contract is the normal
+// case and needs no special syntax; several is how the quoter runs on more than
+// one book at once.
+func splitFeeds(v string) []string {
+	var out []string
+	for _, f := range strings.Split(v, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"AAH6"}
+	}
+	return out
+}
+
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -183,44 +216,63 @@ func main() {
 		log.Fatalf("connect %s: %v", cfg.NatsURL, err)
 	}
 	defer nc.Close()
-	log.Printf("%s quoting %s clip=%d maxpos=%d edgefloor=%.1f skewfrac=%.1f",
-		cfg.Sender, cfg.Feed, cfg.Clip, cfg.MaxPos, cfg.EdgeTicks, cfg.SkewFrac)
+	log.Printf("%s quoting %v clip=%d maxpos=%d edgefloor=%.1f skewfrac=%.1f",
+		cfg.Sender, splitFeeds(cfg.Feed), cfg.Clip, cfg.MaxPos, cfg.EdgeTicks,
+		cfg.SkewFrac)
 
-	mt, err := fetchMeta(nc, cfg.Feed, 20*time.Second)
-	if err != nil {
-		log.Printf("EX_META unavailable (%v); configured defaults apply", err)
-	}
-	applyMeta(&cfg, mt)
-	log.Printf("meta %s: tick=%d max_tps=%d poslim=%d -> rate=%d burst=%d maxpos=%d",
-		cfg.Feed, mt.tickSize, mt.maxTPS, mt.positionLimit,
-		cfg.MaxTPS, cfg.MaxBurst, cfg.MaxPos)
+	// One quoter per contract. They share an order-id allocator, because ids are
+	// consumed per *sender* rather than per feed, and a NATS connection; they
+	// share nothing else -- each keeps its own book, inventory and position limit.
+	// The hedger already sums exposure across every contract (ex.md.*.<sender>),
+	// so more feeds need no change there.
+	gen := newIDs()
+	var quoters []*quoter
 
-	q := newQuoter(nc, cfg)
+	for _, feed := range splitFeeds(cfg.Feed) {
+		fc := cfg
+		fc.Feed = feed
 
-	if _, err := nc.Subscribe("ex.bbo."+cfg.Feed, q.onBBO); err != nil {
-		log.Fatalf("subscribe bbo: %v", err)
-	}
-	if cfg.UseRef {
-		// Every contract's top of book, so the leading sibling can be identified
-		// from activity instead of being configured.
-		if _, err := nc.Subscribe("ex.bbo.*", q.onAnyBBO); err != nil {
-			log.Fatalf("subscribe reference bbo: %v", err)
+		mt, err := fetchMeta(nc, feed, 20*time.Second)
+		if err != nil {
+			log.Printf("EX_META unavailable for %s (%v); configured defaults apply",
+				feed, err)
 		}
-	}
-	// Our own fills, straight from the exchange.
-	if _, err := nc.Subscribe("ex.md."+cfg.Feed+"."+cfg.Sender, q.onOwnMD); err != nil {
-		log.Fatalf("subscribe md: %v", err)
+		applyMeta(&fc, mt)
+		log.Printf("meta %s: tick=%d max_tps=%d poslim=%d -> rate=%d burst=%d maxpos=%d",
+			feed, mt.tickSize, mt.maxTPS, mt.positionLimit,
+			fc.MaxTPS, fc.MaxBurst, fc.MaxPos)
+
+		q := newQuoter(nc, fc, gen)
+		if _, err := nc.Subscribe("ex.bbo."+feed, q.onBBO); err != nil {
+			log.Fatalf("subscribe bbo %s: %v", feed, err)
+		}
+		if fc.UseRef {
+			// Every contract's top of book, so the leading sibling can be
+			// identified from activity instead of being configured.
+			if _, err := nc.Subscribe("ex.bbo.*", q.onAnyBBO); err != nil {
+				log.Fatalf("subscribe reference bbo: %v", err)
+			}
+		}
+		// Our own fills on this contract, straight from the exchange.
+		if _, err := nc.Subscribe("ex.md."+feed+"."+fc.Sender, q.onOwnMD); err != nil {
+			log.Fatalf("subscribe md %s: %v", feed, err)
+		}
+		quoters = append(quoters, q)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go q.requoteLoop(ctx)
-	go q.reportLoop(ctx)
+	for _, q := range quoters {
+		go q.requoteLoop(ctx)
+		go q.reportLoop(ctx)
+	}
 
 	<-ctx.Done()
 	log.Print("shutting down, pulling quotes")
-	q.cancelAll()
-	log.Printf("final: %s", q.status())
+	for _, q := range quoters {
+		q.cancelAll()
+		log.Printf("final: %s", q.status())
+	}
 	_ = nc.Drain()
 }
