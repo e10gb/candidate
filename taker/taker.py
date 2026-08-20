@@ -15,11 +15,12 @@ Config (env):
   TAKER_THRESH    mid move (price units) that triggers a trade (default 10)
   TAKER_LAG       distinct top-of-book changes the move spans (default 5)
   TAKER_RUN       seconds to run               (default 20)
+  TAKER_MODE      "reversion" (fade a move) or "momentum" (follow it)
+                  (default reversion -- see the note beside MODE below)
 """
 import asyncio
 import collections
 import os
-import random
 import time
 
 import nats
@@ -41,12 +42,40 @@ RUN_S = float(os.environ.get("TAKER_RUN", "20"))
 # disconnects the sender outright (changelog v2.3) rather than rejecting, and this
 # was the only seat with no self-imposed cap at all.
 COOLDOWN = float(os.environ.get("TAKER_COOLDOWN", "0.5"))
+# Which way to trade a move: "reversion" fades it, "momentum" follows it.
+#
+# This seat shipped as momentum, and momentum is the wrong sign for this market:
+# the sample market's price walks to a target and back inside a hard band
+# (sim/market.py clamps to [440, 760]), so a move is more likely to unwind than
+# to continue, and the seat lost money in every measurement.
+#
+# The desk needs someone taking that trade. Markout showed the profit here is in
+# holding through the reversion -- but the quoter must not hold, because Job 2's
+# whole point is that the desk stays flat, and the hedger correctly clears its
+# inventory. So reversion goes to the seat whose job *is* directional risk, sized
+# and bounded by TAKER_MAX_POS, rather than leaking into the quoter as unhedged
+# exposure.
+#
+# This is fitted to a mean-reverting market and would be wrong in a trending one,
+# exactly as the original momentum setting was wrong here. Set TAKER_MODE=momentum
+# to restore the shipped behaviour.
+MODE = os.environ.get("TAKER_MODE", "reversion").lower()
 
 
 class Taker:
     def __init__(self, nc):
         self.nc = nc
-        self.oid = random.randint(0, 80_000_000)  # avoid id clashes across runs
+        # Order ids are consumed permanently per sender, and `restart: on-failure`
+        # makes restarts routine, so they must never repeat across one. A random
+        # start only makes a clash unlikely, and the clash is silent (reject 203);
+        # the old 8-digit decimal format would also have emitted a 9-character id
+        # (reject 100) once the counter passed 99,999,999.
+        #
+        # The guarantee is conditional: this clears the previous run's *starting*
+        # point immediately, and its *ending* point only while ids are consumed
+        # more slowly than the clock advances (1000/sec). This seat trades at most
+        # twice a second, so the headroom is ample.
+        self.oid = int(time.time() * 1000)
         self.best_bid = None
         self.best_ask = None
         self.mids = collections.deque(maxlen=LAG + 1)
@@ -82,9 +111,16 @@ class Taker:
         self.apply_fill(side, int(f[4]), int(f[5]))
         self.fills += 1
 
+    BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
     def next_oid(self):
+        """8 chars, monotonic, never recycled."""
         self.oid += 1
-        return f"{self.oid:08d}"
+        n, out = self.oid, []
+        for _ in range(8):
+            out.append(self.BASE36[n % 36])
+            n //= 36
+        return "".join(reversed(out))
 
     def mid(self):
         if self.best_bid is None or self.best_ask is None:
@@ -119,10 +155,20 @@ class Taker:
         if time.monotonic() - self.last_trade_at < COOLDOWN:
             return
         past, now = self.mids[0], self.mids[-1]
-        if now - past >= THRESH and self.position < MAX_POS and self.best_ask is not None:
-            await self.take("B")
-        elif past - now >= THRESH and self.position > -MAX_POS and self.best_bid is not None:
-            await self.take("S")
+        # up = the side to trade when the price has *risen* by THRESH.
+        # Momentum follows it (buy); reversion fades it (sell).
+        up, down = ("B", "S") if MODE == "momentum" else ("S", "B")
+        rose, fell = now - past >= THRESH, past - now >= THRESH
+        if rose and self.can_trade(up):
+            await self.take(up)
+        elif fell and self.can_trade(down):
+            await self.take(down)
+
+    def can_trade(self, side):
+        """Room inside the position limit, and a price on the side we would hit."""
+        if side == "B":
+            return self.position < MAX_POS and self.best_ask is not None
+        return self.position > -MAX_POS and self.best_bid is not None
 
     async def take(self, side):
         async with self.send_lock:
@@ -222,8 +268,8 @@ async def main():
     await nc.subscribe(f"ex.bbo.{FEED}", cb=t.on_bbo)
     # Our own fills, as the exchange recorded them.
     await nc.subscribe(f"ex.md.{FEED}.{SENDER}", cb=t.on_md)
-    print(f"[taker] {SENDER} trading {FEED} clip={CLIP} thresh={THRESH} "
-          f"for {RUN_S}s", flush=True)
+    print(f"[taker] {SENDER} trading {FEED} mode={MODE} clip={CLIP} "
+          f"thresh={THRESH} for {RUN_S}s", flush=True)
     rep = asyncio.create_task(t.reporter())
     await asyncio.sleep(RUN_S)
     rep.cancel()
