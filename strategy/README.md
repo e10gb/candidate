@@ -13,6 +13,17 @@ tried and rejected.
    (`PROTOCOL.md`), so the leader is discovered at runtime rather than configured.
    Pricing off a quieter sibling would import lag, so the rule is "follow the
    busiest, unless that is us".
+
+   **In the shipped configuration this resolves to "us", and that is a known bug.**
+   Activity is counted in BBO updates per feed, and our own quoting generates BBO
+   updates on our own feed. Measured with no desk running, AAH6 leads AAM6 by 11%
+   (4,338 vs 3,897 in 25s) -- a margin our own requoting more than covers, so the
+   quoter out-ticks the real lead and declares itself the leader. The status line
+   reports `ref=own` for the whole run, and reference pricing is inert whenever the
+   desk is actually trading. Fixing it means measuring activity in something we do
+   not ourselves produce (counterparty trades rather than book churn); that change
+   is not made here because run-to-run noise on this market is larger than any
+   effect it could be shown to have in the runs available. See NOTES.md, Session 9.
 2. **Edge.** `EdgeVolMult x stdev(mid)` over a rolling window, floored at
    `QUOTER_EDGE` and capped. A spread has to cover how far the price moves while
    you are holding, and that distance is a property of the market, not a constant:
@@ -64,15 +75,11 @@ All optional; defaults in brackets. Empty values are treated as unset.
 | `QUOTER_EDGE_VOL` | `4.0` | edge as a multiple of measured volatility; `0` = fixed edge |
 | `QUOTER_MAX_EDGE` | `20` (compose: `40`) | absolute cap on the edge |
 | `QUOTER_VOL_WINDOW_MS` | `2000` | volatility measurement window |
-| `QUOTER_FAST_VOL_MS` | `0` (off) | second, shorter volatility horizon; the edge takes whichever is wider. Trialled at 250 and measured worse -- widening mid-burst forces a cancel-replace that posts a fresh order into the moving market |
 | `QUOTER_SKEW_FRAC` | `1.0` | inventory lean at full position, as a fraction of the edge |
 | `QUOTER_MIN_EDGE` | `1` | margin every quote keeps against fair value |
-| `QUOTER_USE_REF` | `1` | price off the busiest sibling contract; `0` disables |
+| `QUOTER_USE_REF` | `1` | price off the busiest sibling contract; `0` disables. Currently inert in practice -- see the note under "How it prices" |
 | `QUOTER_BASIS_ALPHA` | `0.05` | EWMA weight for the learned lead-to-ours offset |
 | `QUOTER_REF_STALE_MS` | `2000` | ignore the lead if it has not updated within this |
-| `QUOTER_TIERS` | `1` | quotes per side; `2` adds a tight inner quote (trialled, measured worse here) |
-| `QUOTER_INNER_EDGE_FRAC` | `0.4` | inner tier's edge, as a fraction of the full edge |
-| `QUOTER_INNER_SIZE_FRAC` | `0.4` | inner tier's size, as a fraction of the clip |
 | `QUOTER_PULL_MOVE` | `0` (off) | leave the book entirely when the price moves this far within `QUOTER_PULL_WINDOW_MS`. Pulling, not widening: widening changes the target price, so reconcile cancels and re-adds, and the re-add posts a fresh order into the move |
 | `QUOTER_PULL_WINDOW_MS` | `200` | window over which that move is measured |
 | `QUOTER_PULL_MS` | `300` | how long to stay out once triggered |

@@ -4,6 +4,9 @@
 package main
 
 import (
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,30 +15,22 @@ import (
 
 func testCfg() config {
 	return config{
-		Sender:        "QUOTE001",
-		Tiers:         1, // single tier unless a test opts in
-		Feed:          "AAH6",
-		Clip:          5,
-		MaxPos:        25,
-		EdgeTicks:     2,
-		SkewFrac:      1.0,
-		MinEdgeTicks:  1,
-		EdgeVolMult:   0, // fixed edge unless a test opts in
-		MaxEdgeTicks:  120,
-		VolWindow:     2 * time.Second,
-		FastVolWindow: 0, // off unless a test opts in
-		PullMove:      0, // off unless a test opts in
-		PullWindow:    200 * time.Millisecond,
-		PullFor:       300 * time.Millisecond,
-		MaxTPS:        20,
-		MaxBurst:      8,
+		Sender:       "QUOTE001",
+		Feed:         "AAH6",
+		Clip:         5,
+		MaxPos:       25,
+		EdgeTicks:    2,
+		SkewFrac:     1.0,
+		MinEdgeTicks: 1,
+		EdgeVolMult:  0, // fixed edge unless a test opts in
+		MaxEdgeTicks: 120,
+		VolWindow:    2 * time.Second,
+		PullMove:     0, // off unless a test opts in
+		PullWindow:   200 * time.Millisecond,
+		PullFor:      300 * time.Millisecond,
+		MaxTPS:       20,
+		MaxBurst:     8,
 	}
-}
-
-// outer returns the widest tier on each side, which is the one every
-// pre-existing test was written against.
-func outer(bids, asks []target) (target, target) {
-	return bids[len(bids)-1], asks[len(asks)-1]
 }
 
 // newTestQuoter builds a quoter with a known book and no network.
@@ -49,11 +44,10 @@ func newTestQuoter(t *testing.T, cfg config, bid, ask int) *quoter {
 
 func TestQuotesStraddleMidByEdge(t *testing.T) {
 	q := newTestQuoter(t, testCfg(), 648, 652) // fair 650
-	bids, asks, ok := q.desired()
+	bid, ask, ok := q.desired()
 	if !ok {
 		t.Fatal("expected a quote on a healthy two-sided book")
 	}
-	bid, ask := outer(bids, asks)
 	if bid.px != 648 || ask.px != 652 {
 		t.Errorf("want 648/652 at edge 2 around fair 650, got %d/%d", bid.px, ask.px)
 	}
@@ -69,11 +63,10 @@ func TestSkewNeverQuotesThroughMinEdge(t *testing.T) {
 	q := newTestQuoter(t, cfg, 648, 652) // fair 650
 	for _, pos := range []int{0, 10, 20, 25, -10, -25} {
 		q.position = pos
-		bids, asks, ok := q.desired()
+		bid, ask, ok := q.desired()
 		if !ok {
 			t.Fatalf("pos=%d: expected a quote", pos)
 		}
-		bid, ask := outer(bids, asks)
 		if bid.vol > 0 && float64(bid.px) > 650-cfg.MinEdgeTicks {
 			t.Errorf("pos=%d: bid %d is inside the %.0f-tick margin around fair 650",
 				pos, bid.px, cfg.MinEdgeTicks)
@@ -88,11 +81,9 @@ func TestSkewNeverQuotesThroughMinEdge(t *testing.T) {
 func TestSkewLeansAgainstInventory(t *testing.T) {
 	q := newTestQuoter(t, testCfg(), 648, 652)
 	q.position = 20 // long: we want to sell
-	lb, la, _ := q.desired()
-	longBid, longAsk := outer(lb, la)
+	longBid, longAsk, _ := q.desired()
 	q.position = -20 // short: we want to buy
-	sb, sa, _ := q.desired()
-	shortBid, shortAsk := outer(sb, sa)
+	shortBid, shortAsk, _ := q.desired()
 
 	if longAsk.px >= shortAsk.px {
 		t.Errorf("long should offer cheaper than short: long ask %d, short ask %d",
@@ -116,11 +107,10 @@ func TestSkewScalesWithTheEdge(t *testing.T) {
 		cfg.SkewFrac = 1.0
 		q := newTestQuoter(t, cfg, 1000-int(edge)-5, 1000+int(edge)+5)
 		q.position = cfg.MaxPos / 2 // half inventory -> half a lean
-		b, a, ok := q.desired()
+		bid, _, ok := q.desired()
 		if !ok {
 			t.Fatalf("edge %.0f: expected a quote", edge)
 		}
-		bid, _ := outer(b, a)
 		// Unskewed the bid would sit at fair-edge; the lean is how much further.
 		return (1000 - edge) - float64(bid.px)
 	}
@@ -143,62 +133,12 @@ func TestFullInventoryLeansToTheMinimumEdge(t *testing.T) {
 	cfg.SkewFrac = 1.0
 	q := newTestQuoter(t, cfg, 975, 1025) // fair 1000
 	q.position = cfg.MaxPos               // maximum long: we want to sell
-	b, a, ok := q.desired()
+	_, ask, ok := q.desired()
 	if !ok {
 		t.Fatal("expected a quote")
 	}
-	_, ask := outer(b, a)
 	if want := 1000 + int(cfg.MinEdgeTicks); ask.px != want {
 		t.Errorf("ask should sit at the minimum edge above fair (%d), got %d", want, ask.px)
-	}
-}
-
-// Two tiers: a tight small quote to earn calm-market flow, and a wide one holding
-// the size where a sweep cannot take it cheaply. A single wide quote is safe but
-// forfeits the easy flow, which is why fill counts were only a few dozen a run.
-func TestInnerTierIsTighterAndSmaller(t *testing.T) {
-	cfg := testCfg()
-	cfg.Tiers = 2
-	cfg.InnerEdgeFrac, cfg.InnerSizeFrac = 0.4, 0.4
-	cfg.EdgeTicks = 20
-	q := newTestQuoter(t, cfg, 900, 1100) // fair 1000, wide enough not to clamp
-
-	bids, asks, ok := q.desired()
-	if !ok {
-		t.Fatal("expected quotes")
-	}
-	if len(bids) != 2 || len(asks) != 2 {
-		t.Fatalf("expected 2 tiers a side, got %d/%d", len(bids), len(asks))
-	}
-	if bids[0].px <= bids[1].px {
-		t.Errorf("inner bid %d should be tighter (higher) than outer %d",
-			bids[0].px, bids[1].px)
-	}
-	if asks[0].px >= asks[1].px {
-		t.Errorf("inner ask %d should be tighter (lower) than outer %d",
-			asks[0].px, asks[1].px)
-	}
-	if bids[0].vol >= bids[1].vol {
-		t.Errorf("inner size %d should be smaller than outer %d",
-			bids[0].vol, bids[1].vol)
-	}
-}
-
-// Tiers share one position limit; they must not each quote the full remaining
-// room and breach it between them.
-func TestTiersShareThePositionLimit(t *testing.T) {
-	cfg := testCfg()
-	cfg.Tiers = 2
-	q := newTestQuoter(t, cfg, 900, 1100)
-	q.position = cfg.MaxPos - 3 // only 3 lots of room left, across both tiers
-
-	bids, _, _ := q.desired()
-	total := 0
-	for _, b := range bids {
-		total += b.vol
-	}
-	if total > 3 {
-		t.Errorf("tiers would buy %d lots with only 3 of room", total)
 	}
 }
 
@@ -374,8 +314,7 @@ func TestSizeNeverBreachesPositionLimit(t *testing.T) {
 	cfg := testCfg()
 	q := newTestQuoter(t, cfg, 648, 652)
 	q.position = cfg.MaxPos - 2 // room for 2 more
-	b, a, _ := q.desired()
-	bid, ask := outer(b, a)
+	bid, ask, _ := q.desired()
 	if bid.vol != 2 {
 		t.Errorf("bid size should be capped to the remaining 2, got %d", bid.vol)
 	}
@@ -383,8 +322,7 @@ func TestSizeNeverBreachesPositionLimit(t *testing.T) {
 		t.Errorf("sell side should be unrestricted, got %d", ask.vol)
 	}
 	q.position = cfg.MaxPos
-	b, a, _ = q.desired()
-	bid, _ = outer(b, a)
+	bid, _, _ = q.desired()
 	if bid.vol != 0 {
 		t.Errorf("at the limit the buy side must not quote, got %d", bid.vol)
 	}
@@ -414,47 +352,6 @@ func TestEdgeScalesWithVolatility(t *testing.T) {
 	}
 	if wild > cfg.MaxEdgeTicks {
 		t.Errorf("edge %.1f exceeded the cap %.0f", wild, cfg.MaxEdgeTicks)
-	}
-}
-
-// A burst inside the fast window must widen the edge even while the slow window
-// still reads calm -- that gap is where the picking-off happened: measured -7.15
-// per lot at 100ms after a fill against -0.49 by 500ms.
-func TestFastVolatilityCatchesABurstTheSlowWindowMisses(t *testing.T) {
-	cfg := testCfg()
-	cfg.EdgeVolMult = 4
-	cfg.VolWindow = 10 * time.Second
-	cfg.FastVolWindow = 200 * time.Millisecond
-	cfg.MaxEdgeTicks = 0
-	q := newTestQuoter(t, cfg, 995, 1005)
-
-	// A long calm history, then a real pause so it falls *outside* the fast
-	// window -- otherwise both horizons see the same samples and the test proves
-	// nothing (which is exactly what it did first time round).
-	q.mu.Lock()
-	for i := 0; i < 200; i++ {
-		q.pushMid(1000)
-	}
-	slowOnly := q.cfg.EdgeVolMult * q.volatility()
-	q.mu.Unlock()
-	time.Sleep(cfg.FastVolWindow + 50*time.Millisecond)
-
-	// Then a burst, entirely inside the fast window.
-	q.mu.Lock()
-	for _, m := range []float64{1000, 1040, 960, 1050} {
-		q.pushMid(m)
-	}
-	fast := q.volatilityOver(cfg.FastVolWindow)
-	slow := q.volatility()
-	edge := q.edge()
-	q.mu.Unlock()
-
-	if fast <= slow {
-		t.Errorf("the burst should read louder on the fast window: fast %.1f, slow %.1f",
-			fast, slow)
-	}
-	if edge <= slowOnly {
-		t.Errorf("edge should widen on the fast reading (%.1f), got %.1f", fast, edge)
 	}
 }
 
@@ -545,14 +442,14 @@ func TestFillSideFromExecutionAndTrade(t *testing.T) {
 
 func TestPartialFillLeavesOrderResting(t *testing.T) {
 	q := newTestQuoter(t, testCfg(), 648, 652)
-	q.bids[0] = resting{id: "bbbbbbbb", px: 648, vol: 5}
+	q.bid = resting{id: "bbbbbbbb", px: 648, vol: 5}
 	q.onOwnMD(&nats.Msg{Data: []byte("1 E O:aaaaaaaa QUOTE001:bbbbbbbb 2 648 1 S")})
-	if !q.bids[0].live() || q.bids[0].vol != 3 {
+	if !q.bid.live() || q.bid.vol != 3 {
 		t.Errorf("a partial fill should leave 3 resting, got live=%v vol=%d",
-			q.bids[0].live(), q.bids[0].vol)
+			q.bid.live(), q.bid.vol)
 	}
 	q.onOwnMD(&nats.Msg{Data: []byte("1 E O:aaaaaaaa QUOTE001:bbbbbbbb 3 648 1 S")})
-	if q.bids[0].live() {
+	if q.bid.live() {
 		t.Error("a fully filled order should no longer be recorded as resting")
 	}
 }
@@ -580,16 +477,69 @@ func TestQuotesSitOnTheTickGrid(t *testing.T) {
 	cfg.TickSize = 5
 	cfg.EdgeTicks = 12
 	q := newTestQuoter(t, cfg, 940, 1060) // fair 1000
-	bids, asks, ok := q.desired()
+	bid, ask, ok := q.desired()
 	if !ok {
 		t.Fatal("expected a quote")
 	}
-	bid, ask := outer(bids, asks)
 	if bid.px%5 != 0 || ask.px%5 != 0 {
 		t.Errorf("quotes off the tick grid: bid %d ask %d", bid.px, ask.px)
 	}
 	if float64(bid.px) > 1000-cfg.EdgeTicks || float64(ask.px) < 1000+cfg.EdgeTicks {
 		t.Errorf("grid rounding must move prices away from fair, not toward it: %d/%d",
 			bid.px, ask.px)
+	}
+}
+
+// The env path is the one the container actually takes, and it had no test at
+// all: a compaction pass deleted three assignments from the config literal while
+// leaving every reader of them intact, so UseRef fell back to Go's zero value and
+// the quoter stopped pricing off the lead contract. It compiled, the unit tests
+// passed (they all build config literals by hand), and it cost ~6,300 a run.
+// This asserts the defaults a bare container gets.
+func TestConfigFromEnv(t *testing.T) {
+	for _, k := range os.Environ() {
+		if name, _, _ := strings.Cut(k, "="); strings.HasPrefix(name, "QUOTER_") {
+			t.Setenv(name, "")
+		}
+	}
+	cfg := loadConfig()
+	if !cfg.UseRef {
+		t.Error("UseRef defaulted to false: reference pricing is off")
+	}
+	if cfg.BasisAlpha <= 0 {
+		t.Errorf("BasisAlpha = %v, want > 0: the basis would never learn", cfg.BasisAlpha)
+	}
+	if cfg.RefStale <= 0 {
+		t.Errorf("RefStale = %v, want > 0: any lead reads as stale", cfg.RefStale)
+	}
+	if cfg.Clip <= 0 || cfg.MaxPos <= 0 || cfg.EdgeTicks <= 0 {
+		t.Errorf("degenerate sizing/edge defaults: %+v", cfg)
+	}
+	if cfg.MaxEdgeTicks < cfg.EdgeTicks {
+		t.Errorf("MaxEdge %v below floor %v: the cap would invert the edge",
+			cfg.MaxEdgeTicks, cfg.EdgeTicks)
+	}
+}
+
+// Every QUOTER_* variable the README documents must actually be read by the
+// binary. This is the check that turns "the docs drifted" into a failing test.
+func TestDocumentedVarsAreRead(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Skip("no README to check against")
+	}
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, m := range regexp.MustCompile(`QUOTER_[A-Z_]+`).FindAllString(string(readme), -1) {
+		if seen[m] {
+			continue
+		}
+		seen[m] = true
+		if !strings.Contains(string(src), m) {
+			t.Errorf("README documents %s but main.go never reads it", m)
+		}
 	}
 }
