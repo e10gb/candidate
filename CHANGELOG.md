@@ -8,6 +8,112 @@ one annotation where it is factually wrong.
 
 Full reasoning, measurements and retractions are in `NOTES.md`.
 
+## v4.1 — 2026-08-19
+
+- `TAKER_MODE` ships as `momentum`, the strategy as handed over. Reversion
+  measured far better here but is fitted to this market's mean-reverting band and
+  would invert in a trending one; it stays one variable away, with the evidence.
+- **Statistics**: `campaign.sh` reports a 95% CI and how many runs an effect of a
+  given size needs (~21 for 1,000). `tools/sweep.sh` runs configuration lists
+  unattended into a CSV with per-config intervals. Every comparison made before
+  this was underpowered by about an order of magnitude.
+- **Pull rather than widen** (`QUOTER_PULL_MOVE`, off by default): leaves the book
+  entirely after a sharp move instead of repricing into it. Widening measured
+  worse because a reprice posts a fresh order into the move; pulling cannot.
+- **Multi-contract quoting**: `QUOTER_FEED` accepts a comma-separated list, one
+  quoter per contract sharing a sender-wide order-id allocator. Verified on
+  `AAM6,AAU6` with zero id collisions.
+- All three default to off or unchanged: each has a mechanism and tests, none has
+  the sample size to justify moving a default.
+
+## v4.0 — 2026-08-19
+
+- **Desk split by flow type.** The quoter provides liquidity to uninformed flow and
+  stays flat; the taker takes the reversion trade, which is where the money in this
+  market is and which the quoter is forbidden to hold.
+- `TAKER_MODE=reversion` (new, default; `momentum` restores the shipped behaviour).
+  Momentum was the wrong sign for a market that mean-reverts inside a hard band:
+  taker PnL went from -21,309 to +7,544/+7,199/+4,576/-1,938.
+- `HEDGE_THRESH` 12 -> 20 and `TAKER_MAX_POS` 30 -> 15: with the taker holding a
+  deliberate position, a tight threshold made the hedger close its winning trade
+  every swing (taker +7,199, hedger -24,306). Wider tolerance, bounded source.
+- `HEDGE_URGENT` is clamped up to `HEDGE_THRESH` and says so: below it, every hedge
+  is urgent on arrival and the passive path is silently dead.
+- Desk PnL over 5 runs: mean **-3,081** (stdev 5,552) against -19,392 for the
+  configuration replaced. Break-even, not profitable -- stated as such.
+- Tools added: `markout.py` (adverse selection per fill) and `leadsignal.py`
+  (whether toxic flow is predictable before it arrives).
+
+## v3.8 — 2026-08-18
+
+- Completed the 2x2 the v3.7 correction called for: with the taker running the
+  quoter is break-even *regardless of the hedger's feed* (-274 on AAM6, +1,092 on
+  AAH6), killing the self-following-via-hedger hypothesis. The gap to the
+  standalone +13,173 belongs to the taker's presence.
+- Tested the one defensible taker lever, sizing it down (clip 1, max position 10):
+  no PnL recovery (-240 +/- 12,145) and *worse* desk risk (34.9% of the session
+  at/over 10 lots vs 18.1%). Reverted, nothing shipped. The failure is itself
+  informative: a 3x size cut changing nothing means the damage is not
+  proportional impact -- the taker trades at the same moments the market moves.
+- No code changes; configuration ships as in v3.7. The claim stands as: risk
+  control works; the quoter is profitable standalone and break-even in the
+  shipped desk.
+
+## v3.7 — 2026-08-18
+
+- **Corrected the Job 1 headline.** The quoter's +13,173 was measured without the
+  taker; the shipped desk runs it. Full desk, same layout, 3 x 240s: +1,092 +/-
+  5,010 -- break-even, not profitable. Standalone profitability still holds and is
+  reported alongside it.
+
+- Risk is now reported as pooled quantiles rather than a mean and a max. A max
+  grows with the number of samples, so it measured how long we watched rather than
+  how the desk behaved -- which is why the quoted figure moved every time it was
+  re-measured. Shipped configuration, 3 x 240s, 717 samples: mean 4.58, median 2,
+  p95 20, p99 25; 18.1% of the session at/over 10 lots, 1.4% at/over 25.
+- `tools/campaign.sh --full` runs the whole desk and pools risk across repeats.
+  Two bugs in it fixed: it reported "no taker" when the taker was running, and it
+  takes the seats' *code* defaults rather than the compose layout, so measuring
+  what actually ships needs the env passed explicitly (now documented in the tool).
+- Taker order ids: clock-seeded base36, matching the other two seats. A random
+  start only made a restart collision unlikely, and the collision is silent (203);
+  the old 8-digit decimal format would also have emitted a 9-character id past
+  99,999,999. The guarantee is conditional on consuming ids more slowly than the
+  clock advances -- documented, with ~30x headroom at current rates.
+- Documented `HEDGE_INFLIGHT_TTL`; measured the hedger's rate cap at 3.0 req/sec
+  against its limit of 20, so it is not binding and was left alone.
+
+## v3.6 — 2026-08-18
+
+- **Fixed a risk-reporting bug that hid real exposure.** The hedger retired
+  *passive* fills from its in-flight bridge, which only `cross()` ever adds to,
+  cancelling its own position out of the desk calculation: it reported `desk=-7`
+  while the seats held -65 between them. Aggressive fills only, the retirement can
+  no longer flip sign, and the bridge now expires after 1s so no unconfirmed path
+  can mislead indefinitely.
+- Risk is now measured and reported on `held()` (position actually at the
+  exchange), not the bridged view the hedger acts on. Honest figures: mean 3.9-5.3,
+  max 22-25 -- earlier notes quoted ~1.5, which was the bridged number.
+- Removed the redundant price-relative edge cap: two knobs for one job, and it
+  measured no better than the absolute one.
+- Added `strategy/README.md` and `hedger/README.md`; documented all six tools.
+
+## v3.5 — 2026-08-18
+
+- Both seats read `EX_META` at startup: rate limit derived from the exchange's
+  declared `max_tps` with headroom (a guessed cap risks disconnection one way and
+  slowness the other), `position_limit` clamps sizing, `ticksize` puts prices on
+  the grid. Locally `max_tps=0`, so the quoter runs at the market's own event
+  frequency; the 50ms requote sleep is gone (8.2 -> 56.2 req/s measured).
+- Quoter campaign at market speed, 3 x 240s: **+13,173 +/- 6,066, all runs
+  positive** on the quieter sibling priced off the auto-detected lead -- the
+  first measured profit. (Qualified in v3.7: that was measured without the taker.
+  With it, as shipped, the quoter is +1,092 +/- 5,010 -- break-even.) Front month stays negative (-10,002): speed cannot
+  dodge an atomic sweep; it wins the repricing race on the lagging contract.
+- Desk layout ships accordingly: quoter on AAM6, taker on AAH6, hedger watching
+  every contract (`ex.md.*.<sender>`) and hedging combined exposure in AAH6.
+  Verified full-stack: desk exposure max 11-13, mean ~1.9, zero rejects.
+
 ## v3.4 — 2026-08-15
 
 Submission state. Quoter and hedger complete, taker repaired, tests and tooling in

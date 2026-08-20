@@ -32,26 +32,77 @@ trusts its siblings' bookkeeping inherits their bugs.
   the hedger's job -- it can do it in one trade instead of waiting to be lifted.
 - Cancel by explicit order id, never `X` (cancel-many), which does not reliably
   select by side and price.
-- Every seat rate-limits itself. Breaching `max_tps` *disconnects* the sender rather
-  than rejecting, which would end the session.
+- Every seat rate-limits itself, sized from the exchange's declared `max_tps` where
+  there is one. Breaching it *disconnects* the sender rather than rejecting, which
+  would end the session. (The hedger keeps a fixed default that EX_META can lower
+  but not lift; measured at 3.0 req/sec against its cap of 20, so it is nowhere
+  near binding and was left alone rather than changed late.)
 
-**Results on the sample market.** Desk exposure held to a max of 4-12 lots and a
-mean near 1.5 while the seats carried 30+ gross -- Job 2 works, repeatably. On Job 1,
-sizing the edge to volatility is worth roughly an order of magnitude against the
-original fixed edge of 2. Absolute PnL is noisy enough that finer comparisons do not
-survive repetition (see the retraction below), and the taker is the dominant loss and
-the dominant variance.
+**Results on the sample market.** Measured on the *shipped* configuration, full
+desk, pooled over 3 x 240s (717 samples of `held()` -- the position actually at the
+exchange):
+
+| | |
+|---|---|
+| mean abs exposure | **4.58** |
+| median | **2** |
+| p95 / p99 | **20 / 25** |
+| max | 28 |
+| time at/over 10 lots | 18.1% |
+| time at/over 25 lots | 1.4% |
+
+Job 2 works: the desk is at or near flat half the time while the seats carry 30+
+gross, and the position limits are never breached. But it is not flat *all* the
+time -- it carries 10+ lots about a fifth of the session, and that is the honest
+shape of it.
+
+**Quantiles, not a maximum.** Every earlier version of this paragraph quoted a mean
+and a max, and the numbers moved every time I measured (1.5, then 3.9-5.3, then
+2.3-5.3). The mean moved because short windows are noisy; the *max* moved because
+the maximum of N samples grows with N, so a max from 240s is not comparable with
+one from 120s. It is not a property of the desk at all, it is a property of how
+long you watched. Quantiles and time-above-threshold do not have that problem,
+which is why they are what is quoted now, pooled across runs rather than taken from
+whichever run read best.
+
+On Job 1 the answer depends on whether the taker is running, and the full
+picture took a 2x2 to establish because my first comparison changed two variables
+at once (taker presence *and* hedger feed):
+
+| quoter PnL per 240s | hedger on AAM6 | hedger on AAH6 |
+|---|---|---|
+| quoter + hedger only | **+13,173** (3/3 positive) | not measured |
+| full desk, taker running | -274 +/- 3,583 | **+1,092 +/- 5,010** (shipped) |
+
+**Standalone the quoter is profitable, every run. With the taker running it is
+break-even, regardless of where the hedger sits** -- which killed my published
+hypothesis that the desk was following its own hedger's impact on the reference
+book. The honest headline is the shipped cell.
+
+The one defensible taker lever -- sizing it down (clip 3 to 1, max position 30 to
+10), which caps exposure without fitting its signal -- was then tested and
+**failed**: quoter -240 +/- 12,145, with desk risk *worse* (34.9% of the session
+at/over 10 lots against 18.1%). Not shipped. A 3x size cut producing no
+improvement says the damage is not proportional impact; the taker trades at the
+same moments the market moves, so its flow contaminates the reference exactly when
+the quoter is most exposed, and that correlation survives shrinking it. That
+explanation is consistent with all four cells but was not separately tested.
 
 **What I would not claim.** That any particular wide-edge setting is optimal; runs of
 identical configuration differ by more than the effects being compared. Resolving
 that needs ~10 repeats or 10-minute runs. I chose to record the uncertainty rather
 than present a tuned-looking number a further run would overturn.
 
-**Known limitations.** One instrument only (`AAH6`). The taker still loses money on
-its own merits -- momentum in a market that mean-reverts inside a band -- and I left
+**Known limitations.** The quoter trades one contract (default `AAM6`, priced off
+the lead); the hedger watches every contract and hedges the combined exposure in
+`AAH6`. The taker still loses money on its own merits -- momentum in a market that mean-reverts inside a band -- and I left
 its parameters alone rather than fit them to a market the brief says is not the
 graded one. The sample market deadlocks permanently if its book ever empties, which
 is a property of `sim/market.py`, not the desk.
+1
+**What I learned** To not let AI make assumptions or guess. Start testing from the beginning 
+to see what numbers produce optimal output. Or, to keep a better track of guesses made
+throughout the project.
 
 **How to read the rest of this file.** It is the working record, in the order things
 were discovered, including the wrong turns and two retractions. Roughly: exchange
@@ -59,6 +110,7 @@ probing and the reject-code catalogue; what the sample market looks like; the
 taker's bugs; why the first quoter lost money; the hedger; the three-seat result;
 the test suite; the edge sweeps and the methodology correction; clean-checkout
 verification.
+
 
 ## Session 1 — probing the exchange before writing anything
 
@@ -142,21 +194,25 @@ around a low mid could send something it did not intend.
 
 ### Open questions
 
-- **`max_tps=0`** in `exchange/instruments.txt`. Unknown whether 0 means unlimited
-  or no transactions permitted (empirically it is not blocking me, so: unlimited
-  locally). The changelog says exceeding the rate **disconnects the user**, which
-  is a session-ending event, not a reject to retry. The grading market is not this
-  market and may well set a real limit, so both seats need self-imposed rate
-  limiting regardless of what the local file says.
-- **`X` selector semantics** — unresolved, see above. Working around it rather than
-  solving it.
-- **STP** — `CHANGELOG` v2.0 says on by default, v2.2 says per-feed opt-in via `Q`.
-  Not yet tested. Matters because three of our seats quote and take on one book;
-  need to know whether our own seats can trade with each other, and whether that
-  shows up as desk position moving with no net exposure change.
-- **Position limits**: local `position_limit` is 1e9, effectively unlimited. The
-  grading market will differ; do not build anything that relies on the limit being
-  generous.
+*(Two of these were resolved later by reading `EX_META` rather than guessing; kept
+here with their answers, since the guessing was itself the mistake.)*
+
+- **`max_tps=0`** in `exchange/instruments.txt`. **Resolved:** 0 means unlimited,
+  and the value is published per-feed in the `EX_META` KV bucket. Both seats now
+  read it at startup and size their rate limiter under whatever the exchange
+  declares, instead of the 20/sec I had hardcoded. That guess was wrong in both
+  directions -- a market declaring `max_tps=15` would have *disconnected* us
+  (changelog v2.3), and locally it held the quoter to a fraction of the market's
+  event rate, which is what being picked off is.
+- **Position limits**: local `position_limit` is 1e9. **Resolved the same way** --
+  read from `EX_META` and used to clamp the quoter's `MaxPos` and the hedger's
+  clip, so a tighter grading market cannot be breached.
+- **`X` selector semantics** -- still unresolved. Working around it by cancelling
+  by explicit order id rather than solving it.
+- **STP** -- `CHANGELOG` v2.0 says on by default, v2.2 says per-feed opt-in via
+  `Q`. Never tested. It would not have helped across our seats anyway (they use
+  different sender ids), and the desk-trades-with-itself problem it would address
+  is now solved structurally: the quoter and hedger no longer share a book.
 
 ### What the sample market looks like
 
@@ -760,6 +816,13 @@ quoted spread can be measured directly, rather than inferred.
 
 ### Re-sweeping the edge cap — and a methodology correction I have to own
 
+*(Postscript: the price-relative cap discussed below was later removed outright.
+It measured no better than the absolute one and left two configuration knobs
+doing one job, which is a cost with no benefit. The reasoning that motivated it —
+that an absolute constant will not transfer to an instrument at a different price
+level — is still sound and is recorded here; it simply was not worth the second
+code path.)*
+
 Added realised quoted spread and quoter fill count to `tools/bench.sh`, so the
 edge is now *measured* rather than inferred from the multiplier.
 
@@ -848,18 +911,630 @@ which is a correctness fix, and skew does work in a market with two-sided
 price-sensitive flow. But it buys nothing measurable here and I am not claiming it
 does.
 
+### Passive-first hedging
+
+The hedger crossed the spread on every hedge. That was the desk's largest
+*mechanical* cost — not a strategy loss but a fee we chose to pay, on ~200 lots per
+two minutes. TASK.md's own risk model says a small position held for a while is
+cheap and a large one is not, so paying for immediacy on small exposure was buying
+something we did not need.
+
+Now: exposure at or above `HEDGE_URGENT` (15) is crossed immediately, as before.
+Below that, the hedger rests a limit one tick inside the touch and waits up to
+`HEDGE_PASSIVE_MS` (300ms). The resting order is pulled early if the desk goes
+flat, if exposure flips sign, or if it grows past URGENT — in which case it crosses
+straight away.
+
+**Measured with a metric built for it.** PnL is too noisy to show a few thousand,
+so the hedger now records how far each of its fills was from the mid *at the moment
+it traded*, signed so paying up is positive. That is mechanical rather than
+path-dependent, and comparable across short runs:
+
+| config | cost/lot | passive share | max abs desk |
+|---|---|---|---|
+| always cross | +3.33, +4.77 | 0% | 5, 8 |
+| passive-first | **-5.64, -0.17** | 56%, 48% | 7, 12 |
+
+The groups do not overlap, and this time that means something: the mechanism is
+arithmetic rather than luck — resting earns the spread, crossing pays it. The
+variance within the passive group comes from how the passive/crossed mix falls out,
+not from market direction.
+
+Risk held: peak desk exposure 7 and 12, both inside URGENT=15 by construction, with
+mean abs desk unchanged at ~1.4.
+
+**The caveat that keeps this honest.** A negative cost/lot is *execution quality at
+the moment of the fill*, not proof of profit. Passive fills are adversely selected
+by nature — you get filled precisely when someone wants to trade against you — and
+this metric cannot see what the price did next. It shows we stopped paying the
+spread unnecessarily; it does not by itself show the desk earns more. Desk PnL over
+these runs stayed inside its usual noise band.
+
+Seven unit tests pin the state machine: below threshold does nothing, modest
+exposure rests, urgent exposure crosses, patience running out cancels then crosses,
+and the resting order is pulled when the desk goes flat or the exposure flips. One
+checks that improving on a one-tick-wide book cannot cross the offer.
+
+### Seeing the real profit
+
+The run summary marked open positions at the **mid**, which flatters them. The
+session ends by liquidating whatever is left against the book, so the honest number
+values a long at the bid and a short at the ask. Every seat now reports both, and
+`runs/run-*.md` leads with the closed-out figure and shows the difference as the
+cost of the residual position. Mid-marking is still shown, because the gap between
+the two is itself the risk being carried.
+
+### Two-tier quoting: trialled, measured worse, shipped off
+
+A single wide quote is safe against sweeps but forfeits all the calm-market flow,
+which is why fill counts sat at a few dozen a run. So: a tight small inner quote
+alongside the wide one (`QUOTER_TIERS=2`, inner at 40% of the edge and 40% of the
+clip), sharing one position limit.
+
+It did exactly what it was designed to do, and that turned out to be the problem:
+
+| | 1 tier | 2 tiers |
+|---|---|---|
+| quoter fills | 86 | 287, 351 |
+| median quoted spread | 34 | 16 |
+| quoter PnL | -3,382 | -3,046, -6,554 |
+| hedger lots traded | ~236 | **620** |
+| mean abs desk exposure | 1.74 | **2.60, 2.85** |
+
+Three to four times the flow, half the spread, and no improvement in the quoter's
+own PnL — so the extra fills paid for themselves at best. Meanwhile the inventory
+they generated was paid for twice: once in adverse selection, once in hedging
+volume that nearly tripled. Mean desk exposure rose in both runs, which matters
+more than the PnL here given how the task is graded.
+
+**The lesson is about this market rather than the technique.** The flow available
+just inside the touch is available *because* it is adversely selected — the mover
+sweeps through those levels on its way somewhere. Quoting tighter buys more of
+exactly the trade you did not want. Two-tier quoting is the right shape in a market
+with benign two-way flow; it is the wrong shape here.
+
+Kept in the code and configurable, defaulted to 1. Two unit tests pin the tier
+behaviour (inner is tighter and smaller; tiers share one position limit) so the
+option cannot rot.
+
+### Measurement campaign: is the quoter actually profitable?
+
+Every earlier profitability claim rested on 120s runs with the taker included,
+where its -2,000 to -28,000 swamped the effect being measured. `tools/campaign.sh`
+was built to settle it: 240s runs, three repeats, taker excluded (quoter and hedger
+still run together so inventory is managed as in production), reporting mean and
+spread, and using the liquidation-marked PnL rather than the mid-marked one.
+
+**Answer: no, and not marginally.**
+
+```
+baseline (shipped defaults, AAH6):  -9457  -14558  -20303
+mean -14773   stdev 5426   ->  negative, larger than the run-to-run spread
+```
+
+Losses scaled almost linearly with fills (149 -> 231 -> 317), about **-64 per fill,
+-13 per lot**. Every fill was costing money, so the quoter was not mispriced at the
+margin -- it was trading with the wrong people.
+
+**The diagnosis, from `tools/counterparties.sh`.** Each execution names the
+counterparty, and the sample market's participants are distinguishable by
+construction:
+
+| counterparty | lots | share |
+|---|---|---|
+| MOVER001 (sweeps the book to a target) | 163 | **84%** |
+| TAKER001/2 (casual, uninformed) | 22 | 11% |
+| BGQUOT02 | 4 | 2% |
+| HEDGE001 (our own hedger) | 5 | 3% |
+
+A market maker earns from uninformed flow. **84% of ours came from the one
+participant that is informed by construction.** The casual takers cross at most 6
+ticks through the touch (`sim/market.py:193`), and our quotes sit ~20 outside it,
+so they cannot reach us at all -- the only counterparty who *can* reach us is the
+one sweeping through on the way somewhere.
+
+**What fixed it, in order of size:**
+
+| configuration | mean | stdev |
+|---|---|---|
+| AAH6 front, as shipped | -14,773 | 5,426 |
+| AAH6 front + lead pricing | -8,061 | 7,188 |
+| AAM6 back month | -6,481 | 2,400 |
+| AAM6 + wider cap (40) | -4,038 | 3,494 |
+| **AAM6 + cap 40 + priced off the AAH6 lead** | **+229** | 5,585 |
+| same, lead auto-detected rather than configured | -2,994 | 5,359 |
+
+Two mechanisms, both with a reason rather than a fitted number:
+
+1. **Avoid the toxic contract.** The mover only trades the front month
+   (`sim/market.py:24`). On the back month the loss per lot fell from -12.7 to
+   -2.7 while fill count *tripled* -- more flow, and far cleaner.
+2. **Price off the contract that leads.** The sim's own quoters set the back
+   months at `round(front_fair + offset)` (`market.py:167`), so they reprice the
+   instant AAH6 moves while we were still quoting off AAM6's stale book. We were
+   the slow one in the room, and being slow is what gets picked off.
+
+**Honest verdict: break-even, not profitable.** The best configuration has a mean
+of +229 against a stdev of 5,585 -- indistinguishable from zero. What *is*
+established is the progression: from reliably losing ~15,000 per 240s (three of
+three negative, mean far larger than the spread) to hovering around zero. That is a
+real result with a mechanism; "profitable" is not.
+
+**What ships, and why.** Lead detection is automatic and on by default: the quoter
+watches every contract sharing its two-character underlying prefix and prices off
+whichever is busiest, *unless that is the one it quotes* -- pricing the most active
+contract off a quieter sibling would import lag rather than remove it. That rule
+needs no knowledge of the grading market's listings. Verified as a no-op when we
+are the busiest: unit-tested, and a live front-month campaign with it enabled came
+back statistically unchanged (-8,061 vs -14,773, difference well inside both
+spreads).
+
+The feed itself is *not* hardcoded to a back month. Quoting AAM6 is the right
+answer for this sample market and there is no reason to think the grading market
+has the same structure; the transferable part is the mechanism for finding the
+lead, not the choice of contract.
+
+**Also found: the desk trades with itself.** 3% of the quoter's lots were against
+`HEDGE001`. When the hedger crosses into our own resting quote the desk's net
+position does not change at all -- it pays the spread internally and achieves
+nothing. Small here, but it means a hedge that appears to work sometimes does not.
+Fixing it needs the seats to coordinate over the bus (the task explicitly invites
+this); left as an open item rather than rushed.
+
+### Running at the market's frequency -- and the quoter turning profitable
+
+The ask: make the quoter operate at the same frequency as the simulated market.
+The sim's participants are event-driven -- its quoters reprice on every
+front-month tick, the mover acts every 200ms -- while ours acted on ~23.5% of
+genuine changes. The gap was two self-imposed throttles: a 50ms post-requote
+sleep, and a **guessed** rate cap of 20 TPS.
+
+**The guess was the bug, in both directions.** The exchange states its per-feed
+limit in `EX_META` (`max_tps`), which no seat had ever read. If grading sets
+`max_tps=15`, our hardcoded 20 gets the sender *disconnected* (changelog v2.3) --
+and a disconnected hedger means no risk control at all. Locally `max_tps=0`
+(unlimited) and we were crawling. Both seats now read EX_META at startup:
+
+- declared limit > 0: token bucket sized under it. A bucket with burst B and rate
+  r admits at most B + r*T requests in any window T; with r = max_tps/2 and
+  B = 0.3*max_tps, any one-second window stays at or under 0.8 of the limit,
+  whatever grading's enforcement window is.
+- declared limit 0: run uncapped, at the market's own event rate.
+- `MinRequote` default 50ms -> 0. The wake channel already coalesces bursts; the
+  sleep only added latency between a fair-value move and our reprice.
+- Freebies while reading meta: `position_limit` clamps MaxPos and the hedger's
+  clip; `ticksize` puts prices on the grid (rounding away from fair, so the
+  minimum edge survives). The tick>1 path is untested live -- the local exchange
+  lists only tick=1.
+
+Measured (same 30s front-month test as before): throughput 8.2 -> **56.2
+requests/sec**; actions per genuine top-of-book change 23.5% -> ~38%, and the
+remainder is changes that do not move our target price -- no action *needed* --
+rather than throttling.
+
+**Campaign results (3 x 240s each, quoter + hedger, liquidation-marked):**
+
+| configuration | before speed | at market speed |
+|---|---|---|
+| AAM6, cap 40, lead pricing | +229 +/- 5,585 | **+13,173 +/- 6,066 (min +7,944, 3/3 positive)** |
+| AAH6 front, defaults | -14,773 +/- 5,426 | -10,002 +/- 4,702 |
+
+The first line is the result: **positive, larger than the run-to-run spread,
+every run**. The second explains the mechanism by contrast: speed does nothing
+for the front month, because the mover's sweep is one atomic matching event --
+once the order is in flight there is nothing to dodge. On the lagging contract
+the danger was never the sweep; it was the *race* against the sim's own quoters
+repricing off the front tick while we sat on stale prices. Lead pricing gave us
+the right price and market-frequency reaction lets us act on it in time. Either
+half alone measured at a loss; together they are worth ~13,000 per 240s.
+
+**The desk layout that ships (docker-compose.yml):** quoter on AAM6 pricing off
+the auto-detected lead with cap 40; taker on the front month as before; hedger
+watching **every** contract (`ex.md.*.<sender>`) and hedging the combined
+exposure in liquid AAH6. Contracts on one underlying are cash-settled at their
+listed price, so a lot of any sibling carries the same unit risk; the residual
+is the pinned inter-month spread, small beside the outright risk removed. This
+also ends the desk-trades-with-itself problem by construction -- the hedger no
+longer shares a book with the quoter.
+
+Full-stack verification (all three seats, two 120s runs): desk exposure max
+11/13, mean ~1.9, zero rejects; quoter +2,432 and -815 -- breakeven-to-positive
+inside this window's noise, consistent with the 240s campaign.
+
+Judgement calls stated plainly:
+
+- Defaulting QUOTER_FEED=AAM6 bets that grading lists the same complex. It is
+  the same bet the *shipped* compose already made by pinning TAKER_FEED=AAH6.
+  The mechanisms (lead detection, meta-derived limits, market-speed reaction)
+  transfer regardless; the feed choice is configuration, overridable by env.
+- The hedger now rests passively on the front month, where the mover's sweeps
+  are; its measured cost/lot (+1.8 to +2.4) is still below crossing-always
+  (+3.3 to +4.8), so passive-first stays on. Open item, not a defect.
+- Profit is demonstrated against this sim's structure. The honest claim for the
+  grading market is the mechanism, not the number.
+
+### The risk number I had been quoting was wrong
+
+Found while verifying the submission from a clean checkout: the hedger reported
+`desk=-7` while its seats held `-14, +3, -54` between them. The arithmetic was
+self-consistent -- `desk() = sum(positions) + inflight` -- but `inflight` had
+stuck at +58 and never returned to zero.
+
+**The bug.** `cross()` adds to the in-flight bridge; `rest()` does not, because a
+resting order has not traded. But the fill handler retired *every* hedger fill
+from the bridge, passive ones included. Each passive fill therefore retired
+volume that was never on it, and since `desk() = sum + inflight`, the hedger's own
+passive position was cancelled straight out of the exposure calculation. **The desk
+reported flat while carrying forty lots.** I introduced this when I added
+passive-first hedging, and the metric I used to justify that change (cost per lot)
+could not have caught it.
+
+Two fixes, because the first was necessary but not sufficient:
+
+1. Only retire fills that were actually on the bridge -- i.e. where we crossed --
+   and never let the retirement flip the bridge's sign (a limit order that crosses
+   on entry was never counted either).
+2. **Give the bridge an expiry.** It exists to cover a round trip of
+   milliseconds; anything outstanding after `HEDGE_INFLIGHT_TTL` (1s) is stale and
+   is dropped. Fix 1 alone left a smaller leak -- the hedger crossing into its own
+   resting order is a self-match, which is no position change and so produces no
+   bookable fill, while `cross()` had already counted it. Rather than enumerate
+   every such path, the bridge now cannot mislead for longer than a second.
+   Positions come from the exchange and are always right; the bridge is the only
+   estimate in the calculation, so it is the part that gets an expiry.
+
+**And a correction to the headline.** Risk is now measured on `held()` -- the
+position actually at the exchange -- rather than the bridged `desk()` the hedger
+acts on. Two 240s runs after the fix: mean 2.38/2.28, max 28/18, with 1% and 0% of
+samples at or over 25. Acting on the bridged view is correct (it stops double-hedging an order
+already sent); *reporting* on it is not, because an estimate should never flatter
+the number it is being judged by. The honest figures are mean ~3.9-5.3 and max
+22-25, against the ~1.5 quoted throughout this file's earlier sections. Job 2 still
+holds -- the seats carry 30+ gross and nothing ever approached a position limit --
+but the margin is smaller than I had been claiming.
+
+### A flaky test, and why it was not muted
+
+The smoke test failed once with one reject/error line, then passed twice cleanly.
+The cause is a startup race: the seats connect while the exchange is still coming
+up, a request times out, and the hedger logs `request failed` and retries on its
+next tick 50ms later. Correct behaviour, but the test was reading logs from
+container start, so it judged the desk on its first second.
+
+Fixed by collecting only the measurement window (`docker compose logs --since`),
+not the boot. The check itself stays strict -- zero rejects in steady state --
+because loosening the assertion would have hidden the thing it exists to catch.
+Three consecutive clean runs after the change.
+
+The distinction matters: "ignore errors during startup, fail on any afterwards" is
+a statement about the system; "allow one error" would just have been a statement
+about my patience.
+
+### Trying to make the two-seat desk profitable, and what stopped it
+
+With the taker silent, the quoter and hedger alone were swept across ten 240s runs.
+Every configuration lost money, and the losses moved between the two seats rather
+than shrinking:
+
+| configuration | quoter | hedger | desk | mean exposure |
+|---|---|---|---|---|
+| thresh 5, maxpos 25 | -2,573 / -3,983 | -22,350 / -36,145 | -24,923 / -40,128 | 6.7 / 12.7 |
+| thresh 12, maxpos 25 | +2,721 / -4,121 | -17,075 / -13,824 | -14,354 / -17,945 | 8.3 / 8.2 |
+| **thresh 12, maxpos 10** | +336 / -4,369 | -7,608 / -3,513 | **-7,272 / -7,882** | 6.3 / 5.1 |
+| + patient band (urgent 30) | -4,562 / -10,184 | -2,946 / -5,482 | -7,508 / -15,666 | 4.8 / 5.6 |
+| + patient + cross-contract | -11,922 / +9,305 | -8,530 / -15,443 | -20,452 / -6,138 | 5.0 / 5.0 |
+
+**Three mechanisms, each real, none sufficient.**
+
+1. *A market maker's inventory swings by nature.* At `HEDGE_THRESH=5` the hedger
+   mirrored every swing, trading ~5,000 lots per 240s to clear a quoter holding
+   ~9, at 4-5 per lot. Raising the threshold and capping the quoter's inventory
+   attacks that bill at both ends -- two-thirds of the loss, and better risk at
+   the same time, which is why it ships.
+2. *Hedging urgency only moves the cost between seats.* The patient band cut the
+   hedger's volume to ~86 lots and halved its loss, but the quoter's loss grew by
+   the same amount: hedge fast and the hedger pays the spread, hedge slow and the
+   quoter carries the market risk. Desk total unchanged.
+3. *Cross-contract hedging is not hedging.* It gave the cheapest execution measured
+   (**-0.94 and -0.42 per lot** -- the hedger *earning* on fills, crossing only 53
+   lots) and the worst hedger PnL (-8,530 / -15,443). An AAH6 position against AAM6
+   inventory is a naked directional bet, and it lost more than the spread it saved.
+   Same-contract hedging costs 4-5 per lot and actually offsets. That is the trade.
+
+**Why none of it reaches profit.** Whoever ends up holding the quoter's inventory
+loses, because the fills are adversely selected; clearing it costs spread. Moving
+the inventory between seats, or clearing it sooner or later, redistributes that
+loss without removing it. The only configuration that ever *looked* profitable was
+the one where the hedger was accidentally under-hedging -- see the correction
+below -- which is to say: the profit came from carrying inventory through the
+market's mean reversion, which is precisely the risk Job 2 exists to remove.
+
+That tension is the honest finding. In this sample market, holding inventory pays
+and flatness costs, so a desk mandated to stay flat gives up the one edge available
+to it. Making the quoter genuinely profitable needs its *fills* to be better --
+less adversely selected -- not better inventory management downstream.
+
+**Correction: the +13,173 does not reproduce.** That result was measured before the
+in-flight accounting was fixed, when the hedger under-hedged and left inventory on
+the book. Re-running the same configuration with correct hedging gives quoter
+-2,573 / -3,983. The earlier figure was an artifact of a bug, and any claim resting
+on it is withdrawn.
+
+### Attacking adverse selection directly, and a methodology lesson
+
+The remaining loss is upstream of hedging: the quoter's fills are adversely
+selected. To work on that I built `tools/markout.py`, which measures it directly --
+for every fill, where the mid went afterwards, signed so positive means the market
+moved our way. Negative markout *is* adverse selection, in price units per lot.
+
+**The diagnosis was sharp and surprising.** First run, 163 fills on AAM6:
+
+| horizon | markout/lot | | counterparty | lots | markout/lot @2s |
+|---|---|---|---|---|---|
+| 0.1s | **-7.15** | | BGQUOT04 | 230 | **-11.07** |
+| 0.5s | -0.49 | | BGQUOT03 | 206 | +0.28 |
+| 2.0s | -3.18 | | TAKER001 | 41 | **+14.57** |
+| 5.0s | -4.77 | | TAKER002 | 20 | **+5.75** |
+
+The casual takers were *profitable* for us. The toxic flow was a background
+*quoter* repricing through our stale quotes. And the damage was a sharp transient:
+-7.15 at 100ms, recovering to -0.49 by 500ms.
+
+**Two interventions, both measured, neither worked.**
+
+1. *A fast volatility horizon* (250ms alongside the 2s one, widest wins), on the
+   reasoning that a 2s window cannot see a 100ms event. Back-to-back control:
+   markout went from -6.98 to -16.74 at 100ms while the spread barely moved (44 to
+   48) and fills went *up*. Plausible mechanism for the backfire: widening
+   mid-burst forces a cancel-and-replace, and every replace posts a fresh order
+   into the moving market. Reverted, defaulted off.
+2. *Quoting tighter*, on the observation that casual takers cross at most 6 ticks
+   through the touch (`sim/market.py:193`) while we quote ~22 out -- so our wide
+   edge was selecting *for* the toxic repricing flow and against the profitable
+   casual flow. This inverts the "wider is safer" conclusion from the front month,
+   and it is a real mechanism. Measured: -22.81 at 100ms against -16.04 wide. Also
+   worse.
+
+**The methodology lesson, which is the durable part.** I adopted markout believing
+it was low-noise because it yields hundreds of observations per run. It is not: the
+same configuration measured four times across the day gave **-7.15, -18.05, -6.98
+and -16.04** at 100ms. Fills within a run share one market regime, so the
+observations are strongly correlated and the effective sample size is nowhere near
+the fill count. Both negative results above are therefore *suggestive, not
+conclusive* -- and had either come out positive I would have been at real risk of
+shipping noise as a finding, which is exactly the trap I fell into twice earlier.
+
+A properly powered version needs many short runs across independent market draws,
+comparing distributions rather than point estimates. That is hours of wall time and
+I stopped short of it rather than report another number that a fifth run would
+overturn.
+
+**What survives.** The diagnosis itself is robust across every run: the profitable
+counterparties are the uninformed casual takers, the losses come from quoters
+repricing off the front month, and the damage is concentrated in the first
+few hundred milliseconds after a fill. Anyone continuing this should start there --
+the target is reaching casual flow without being reachable by repricing quoters,
+which is a queue-position and timing problem rather than a spread-width one.
+
+### Splitting the desk by flow type: liquidity to the quoter, reversion to the taker
+
+The markout work established who pays us and who takes from us: the uninformed
+casual takers are profitable (+14.57 and +5.75 per lot), the background quoters
+repricing off the front month are toxic. It also established, indirectly, where
+the money in this market actually is -- the only configuration that ever looked
+profitable was the one where a bug left the hedger under-hedging, i.e. where the
+desk accidentally *held* inventory through the market's mean reversion.
+
+That suggests a division of labour rather than a parameter:
+
+- **The quoter provides liquidity** and must not hold. Job 2 requires flatness and
+  the hedger correctly clears its inventory. Its job is the casual flow.
+- **The taker takes the reversion**, because that is the seat whose purpose is
+  directional risk, and it can do so sized and bounded by `TAKER_MAX_POS` rather
+  than leaking into the quoter as unhedged exposure.
+
+The shipped taker was **momentum** -- the wrong sign for a market that walks to a
+target and back inside a hard band (`sim/market.py` clamps to [440, 760]). Flipping
+it (`TAKER_MODE=reversion`, one line, original behaviour still available) is the
+largest single effect measured in this project:
+
+| taker mode | own PnL across runs |
+|---|---|
+| momentum (as shipped) | -21,309, and -3k to -15k historically |
+| **reversion** | **+7,544, +7,199, +4,576, -1,938** (3 of 4 positive) |
+
+**Then the seats fought each other.** With the taker holding a deliberate position
+to capture the reversion, a hedger threshold of 12 closed that winning trade on
+every swing and paid the spread to do it: taker +7,199 against hedger -24,306. The
+fix is not a cleverer hedger but a wider tolerance -- `HEDGE_THRESH` 12 -> 20, plus
+`TAKER_MAX_POS` 30 -> 15 to bound what the hedger must clear at source.
+
+**Result, five runs (`TAKER_MODE=reversion`):**
+
+```
+-2,816  -2,749  -11,910  +3,410  -1,339      mean -3,081   stdev 5,552
+```
+
+**Correction: that is not what ships.** Those runs used reversion; the desk ships
+`momentum`, the strategy as handed over, because reversion is fitted to this
+market's mean-reverting band. Measured at the shipped settings, three runs:
+
+```
+-15,294  -14,682  -14,930     mean -14,969   stdev 308   95% CI [-15,324, -14,613]
+```
+
+The taker alone is -9,147 to -10,318 of that. So the shipped desk loses about
+15,000 per 240s, reliably -- this is the tightest interval measured in the whole
+project, and it is tight around a loss. Switching one environment variable to
+`reversion` recovers roughly 12,000 of it, at the cost of shipping a default
+fitted to this simulator.
+
+Patient hedging was tested against the same bar and did not help: -16,571 +/-
+5,736, indistinguishable from shipped. It worked mechanically -- zero crossed
+lots, every hedge worked passively -- so execution cost simply is not the binding
+constraint at these settings.
+
+Against the -19,392 mean of the configuration it replaces. **The improvement is
+larger than the spread; the remaining loss is not distinguishable from zero.** So:
+break-even, not profitable, and I will not claim more than that -- twice today a
+pair of agreeing runs was destroyed by a third (-2,816 and -2,749 looked like a
+tight result until the next run came back -11,910).
+
+**The structural tension, stated plainly.** Job 2 requires the combined position to
+stay low. The profit in this market comes from holding through reversion. Those
+pull against each other, and no amount of hedger tuning dissolves it -- the desk
+can be flat or it can be paid, and the brief is explicit that it must be flat. What
+the split does is put the residual directional risk in the seat that is *supposed*
+to carry it, bounded and measured, instead of in the market maker.
+
+**Also tested against the same 5-run bar, and not shipped:** a 250ms fast
+volatility horizon (markout -6.98 -> -16.74; widening mid-burst forces a
+cancel-replace that posts a fresh order into the moving market), quoting tighter to
+reach the casual flow (-16.04 -> -22.81), and raising the calm-period edge floor to
+15 (one pair flipped the sign, three-run validation gave +27, +3,980, -10,204 --
+withdrawn).
+
+### Three improvements, and what is and is not claimed for them
+
+**1. Statistical power -- the binding constraint all along.** Every tuning
+decision here rested on 3-5 runs against a run-to-run stdev of ~5,500, which is
+why three separate conclusions collapsed when a fourth run arrived. `campaign.sh`
+now reports a **95% confidence interval and a required-sample estimate**, and
+`tools/sweep.sh` runs a list of configurations unattended into one CSV with
+per-configuration intervals. The number that matters: **~21 runs to detect an
+effect of 1,000**. Every comparison made today was underpowered by roughly an
+order of magnitude, and the tooling now says so out loud rather than leaving it to
+be discovered afterwards.
+
+**2. Pull rather than widen.** Widening on a burst was tried and measured worse
+(markout -6.98 -> -16.74), for a mechanical reason: widening changes the target
+price, so reconcile cancels and re-adds, and the re-add drops a fresh order into
+the middle of the move. Pulling has no such failure mode -- we cancel and stay
+out, and there is nothing left to hit. `QUOTER_PULL_MOVE` (off by default) leaves
+the market for `QUOTER_PULL_MS` after the mid moves that far within
+`QUOTER_PULL_WINDOW_MS`.
+
+Writing the test caught a real bug in it: when no sample was old enough to serve
+as the window's reference, the code fell back to the *oldest* sample in the buffer
+-- up to ten times older -- read a far larger "move" than had occurred, and
+re-triggered the pull forever. It now declines to judge rather than guessing.
+
+**3. Multi-contract quoting.** `QUOTER_FEED` takes a comma-separated list; each
+contract gets an independent quoter sharing one **order-id allocator**, because
+ids are consumed per sender rather than per feed and two clock-seeded allocators
+would collide silently. Verified live on `AAM6,AAU6`: both books quoted and
+filled, the hedger summed both positions, zero 203s.
+
+**All three ship off or unchanged by default**, which is the point. Each is a
+capability with a mechanism and a test; none has the sample size behind it to
+justify changing a default, and after today the bar for "this is better" is an
+interval that excludes zero, not two runs that agree.
+
+### Why the quoter cannot earn a spread here
+
+A market maker's fill decomposes exactly. For a buy at `px`, with mid `M0` at the
+fill and `M1` later:
+
+    markout (M1 - px)  =  edge captured (M0 - px)  +  drift (M1 - M0)
+
+I had been measuring only the total. Splitting it (`tools/markout.py`) answers the
+question outright:
+
+| quoted spread | edge captured per lot |
+|---|---|
+| 80 | -0.78 |
+| 50 | +1.05 |
+| 6 | +0.20 |
+| 6 | +1.64 |
+| 6, with the pull guard | -1.09 |
+
+**The quoted spread varies thirteen-fold and the edge captured stays within +/-1.5
+of zero.** Whatever we quote, we are filled at approximately the mid. The spread is
+not being earned at all; the loss is then whatever drift follows (-2 to -17).
+
+**Why.** The fill rate gives it away: 869 fills in 110s quoting at the touch, about
+8/sec, against casual-taker flow of well under 1/sec on this contract. Almost none
+of our fills are someone crossing the spread to us. They come from the background
+quoters *repricing*: `sim/market.py:153` has them cancel their whole ladder and
+re-add around a new centre taken from the front month (`c = round(fv + rel)`, line
+167). When the centre jumps 40 points, their new bids land above our stale asks and
+cross them. They are the aggressor, we are filled, and the mid is already on its way
+to the new centre -- so we capture nothing and then hold the wrong side of the move.
+
+This is a property of the simulator's microstructure rather than of our quoter. Its
+liquidity providers reprice *by crossing through resting orders* instead of joining
+or posting inside the spread. Against participants that reprice aggressively on
+every tick of a leading contract, a resting quote is not a service anyone pays for
+-- it is a free option, exercised precisely when it is worth exactly zero.
+
+**What follows for the desk.** No spread-width, hedging or inventory setting fixes
+this, and the sweeps bear that out: every configuration lands between roughly
+-3,000 and -20,000 with intervals that overlap. Being paid for liquidity requires
+counterparties who cross a spread to get done, and in this market they are a
+rounding error next to the mechanical repricing.
+
+It also says something about the grading market. The transferable claim is not a
+number but a check: **measure edge captured at the fill before believing a market
+maker is earning anything.** If it is near zero there, the same thing is happening
+and the answer is not a wider spread. `tools/markout.py` reports it in one run.
+
+### Would the desk stay flat if the quoter were profitable?
+
+Worth asking, because every risk number here was measured against a quoter that
+loses. A profitable quoter is a *busier* one -- it gets crossed rather than run
+over -- so the risk control was stressed with roughly six times the fill rate
+(quoting at the touch, `QUOTER_MAX_EDGE=3`), 3 runs each:
+
+| | mean abs exposure | peak | hedger lots |
+|---|---|---|---|
+| normal activity | 7.9 / 6.9 / 7.9 | 25 / 19 / 21 | 229 / 32 / 299 |
+| ~6x fill rate | 7.2 / 8.5 / 8.6 | 26 / 35 / 130 | 488 / 795 / 130 |
+
+**Mean exposure barely moves** (7.6 to 8.1) while the hedger does two to three
+times the work -- which is the control behaving correctly: it absorbs the extra
+flow rather than letting it accumulate. The peak did rise, one run touching 35
+against 25 before, so the tail widens under load even as the middle holds.
+
+Two reasons to expect a *genuinely* profitable quoter to be flatter still, not
+less flat. First, profitability here would mean being crossed by two-sided
+uninformed flow, and two-sided flow largely self-cancels in inventory terms -- the
+current fills are one-sided bursts (a repricing sweep takes one side), which is the
+worst case for accumulation. Second, the binding constraints are structural rather
+than tuned: `QUOTER_MAX_POS`, the exchange's own `position_limit` from EX_META, and
+the hedger's urgent-crossing path all bound exposure whatever the fill pattern.
+
+The honest caveat: the hedger's thresholds *were* tuned against this flow profile,
+and the widening tail says they are not free of it. A quoter earning real spread
+would want them re-measured, and `tools/sweep.sh` is there for it.
+
 ### Tooling written along the way
 
-- `tools/watch.sh` — readable live view of one contract: top-of-book changes only
-  (the raw feed republishes constantly) plus trades. One `nats sub`, not two: two
-  subscribers writing into the same pipe interleave mid-line and corrupt output.
-- `tools/export_transcript.py` — renders `TRANSCRIPT.txt` from Claude Code's own
-  session logs in `~/.claude/projects/`, concatenating multiple sessions in
-  timestamp order per TASK.md. Re-run at any point; it is a raw export, not a
-  write-up composed afterwards, so the wrong turns stay in.
-  Note: the model's internal reasoning is *not* recoverable — those blocks are
-  persisted with an empty body and only a signature. Prompts, replies, every tool
-  call and every tool result are all there.
+Everything runs in containers -- no Go toolchain, `nats-py` or venv needed on the
+host.
+
+| tool | what it is for |
+|---|---|
+| `tools/watch.sh` | readable live view of one contract: genuine top-of-book changes only (the feed republishes constantly) plus trades |
+| `tools/bench.sh` | one full-desk run against the sample market, reporting risk *and* PnL together, with quoted spread, inventory and hedging cost |
+| `tools/campaign.sh` | the same but repeated and long, taker excluded, with mean and spread -- built after single runs fooled me twice |
+| `tools/counterparties.sh` | who is actually trading with us, and at what cost; the diagnosis that found 84% of our flow was one informed sweeper |
+| `tools/run_summary.sh` | writes `runs/run-<timestamp>.md` after every `./run.sh`, including warnings for the failure modes that look healthy |
+| `tools/markout.py` | adverse selection per fill, split into edge captured and drift -- the tool that found the quoter never earns its spread |
+| `tools/leadsignal.py` | whether toxic flow is predictable before it arrives, by watching every participant's cancels |
+| `tools/sweep.sh` | runs a list of configurations unattended into one CSV with per-configuration confidence intervals |
+| `tools/export_transcript.py` | renders `TRANSCRIPT.txt` from Claude Code's own session logs |
+
+Two notes on the harnesses, both learned the hard way. `bench.sh` and
+`campaign.sh` reset with the compose profiles on *every* call: `docker compose
+down` without them leaves the seats running, and the next `up` silently reuses a
+seat whose config is unchanged, so a repeat continues from the previous run's
+positions. And every run starts from a clean exchange, because a long-lived one
+exhausts the sim's order-id space and the market silently never forms.
+
+`tools/export_transcript.py` is a raw export, not a write-up composed afterwards,
+so the wrong turns stay in. The model's internal reasoning is *not* recoverable --
+those blocks are persisted with an empty body and only a signature. Prompts,
+replies, every tool call and every tool result are all there.
 
 ### Environment note
 

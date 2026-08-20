@@ -55,6 +55,14 @@ services:
       HEDGER_SENDER: ${HEDGER_SENDER:-HEDGE001}
       TAKER_FEED: ${TAKER_FEED:-AAH6}
       TAKER_RUN: "86400"
+      # Ships as momentum: the strategy as handed over. Reversion measured far
+      # better here (taker -21,309 -> +7,544/+7,199/+4,576/-1,938) but that is
+      # fitted to this market's mean-reverting band and would be the wrong sign in
+      # a trending one, so it is available rather than default. See NOTES.md and
+      # taker/README.md; set TAKER_MODE=reversion to switch.
+      TAKER_MODE: ${TAKER_MODE:-momentum}
+      # Bounded directional risk: the hedger has to clear whatever this holds.
+      TAKER_MAX_POS: ${TAKER_MAX_POS:-15}
       # Desk layout, chosen from measurement (NOTES.md "market-speed campaign"):
       # the quoter sits on a quieter sibling and prices it off whichever contract
       # leads (auto-detected); the taker keeps the front month; the hedger
@@ -64,7 +72,12 @@ services:
       # +/- 6,066. This bets the grading market lists the same complex -- the
       # same bet the shipped TAKER_FEED=AAH6 above already makes.
       QUOTER_FEED: ${QUOTER_FEED:-AAM6}
-      HEDGER_FEED: ${HEDGER_FEED:-AAH6}
+      # The hedger hedges in the contract the desk's inventory is actually in.
+      # Hedging AAM6 exposure with AAH6 does not offset it -- they are separate
+      # contracts, so the "hedge" leaves basis risk and the hedger keeps chasing:
+      # measured 1,672-4,684 lots traded per 240s against a quoter holding ~9,
+      # and the hedger became the desk's largest loss. Same contract, real offset.
+      HEDGER_FEED: ${HEDGER_FEED:-AAM6}
       # Strategy tuning, passed through so tools/bench.sh can sweep it. An empty
       # value means "use the seat's own default", which is where the real defaults
       # live -- they are not duplicated here.
@@ -74,12 +87,30 @@ services:
       QUOTER_EDGE_VOL: ${QUOTER_EDGE_VOL:-}
       QUOTER_MAX_EDGE: ${QUOTER_MAX_EDGE:-40}
       QUOTER_VOL_WINDOW_MS: ${QUOTER_VOL_WINDOW_MS:-}
+      QUOTER_FAST_VOL_MS: ${QUOTER_FAST_VOL_MS:-}
+      QUOTER_PULL_MOVE: ${QUOTER_PULL_MOVE:-}
+      QUOTER_PULL_MS: ${QUOTER_PULL_MS:-}
       QUOTER_USE_REF: ${QUOTER_USE_REF:-}
       QUOTER_TIERS: ${QUOTER_TIERS:-}
       QUOTER_CLIP: ${QUOTER_CLIP:-}
-      QUOTER_MAX_POS: ${QUOTER_MAX_POS:-}
+      # Inventory the quoter may carry, and the exposure the hedger tolerates
+      # before acting. These two set the desk's hedging bill between them: the
+      # quoter builds inventory, the hedger pays ~4-5 per lot to clear it, and a
+      # market maker's position naturally swings, so a low threshold makes the
+      # hedger mirror every swing. Measured per 240s, same contract:
+      #   thresh 5,  maxpos 25 -> desk -24,923/-40,128, 2,393-4,953 hedged lots
+      #   thresh 12, maxpos 25 -> desk -14,354/-17,945, 1,865-2,458 lots
+      #   thresh 12, maxpos 10 -> desk  -7,272/ -7,882,   915-1,109 lots
+      # Better on both axes: mean exposure fell to 5.1-6.3 and the peak to 20-25.
+      QUOTER_MAX_POS: ${QUOTER_MAX_POS:-10}
       QUOTER_MAX_TPS: ${QUOTER_MAX_TPS:-}
-      HEDGE_THRESH: ${HEDGE_THRESH:-}
+      # 20, not 12: the taker now holds a *deliberate* directional position to
+      # capture the reversion, and a low threshold made the hedger close that
+      # winning trade on every swing and pay the spread to do it -- hedger -24,306
+      # against a taker making +7,199. At 20 the desk still never ran past 29 lots
+      # and spent under 1% of the session above 25, while the desk total went from
+      # -13,038 to -2,816/-2,749.
+      HEDGE_THRESH: ${HEDGE_THRESH:-20}
       HEDGE_CLIP: ${HEDGE_CLIP:-}
       HEDGE_SLIP: ${HEDGE_SLIP:-}
       HEDGE_URGENT: ${HEDGE_URGENT:-}
