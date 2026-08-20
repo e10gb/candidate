@@ -1556,23 +1556,20 @@ reintroduce a bug.
 
 ### A note on what is in this submission
 
-The measurement tooling and the test suite described throughout this file were
-written and used, but are **not included in this submission** -- omitted
-deliberately to keep it to the desk itself and the record of how it was built.
-Every number quoted here came out of them.
+Everything I wrote or changed: the three seats, the measurement tooling, the test
+suite, the sweep configurations, and the raw results in `runs/` that the numbers in
+this file were computed from. Every claim here can be re-derived from what is in the
+tarball.
 
-They were: a market watcher, a benchmark harness, a repeated-run campaign runner
-with confidence intervals, a markout analyser (adverse selection per fill, split
-into edge captured and drift), a counterparty attribution probe, a leading-signal
-probe, a run summariser, an unattended sweep driver, and a transcript exporter --
-plus 61 tests across four layers, including protocol assertions that pin the
-exchange behaviours this desk depends on and which the shipped documentation gets
-wrong. They can be supplied on request.
+What is *not* included is the scaffolding that came with the task and that I did not
+change -- `sim/`, `exchange/`, `PROTOCOL.md`, `TASK.md`, `README.md`, `setup.sh`. Drop
+these files over a fresh checkout and the desk runs; that is exactly how the
+clean-checkout verification in Session 9 was done.
 
-`run.sh` calls the run summariser if it is present and carries on silently if it
-is not, so the desk runs unchanged without them.
+`run.sh` calls the run summariser if it is present and carries on silently if it is
+not, so the desk also runs unchanged without the tooling.
 
-### Tooling written along the way (not included -- see above)
+### Tooling written along the way
 
 Everything ran in containers -- no Go toolchain, `nats-py` or venv needed on the
 host.
@@ -1758,16 +1755,20 @@ it, which is worth more than a change I would have to describe as unvalidated.
 
 ### Clean-checkout verification
 
-Pristine `git archive 657d59d` (the repo exactly as provided, 18 files), the submission's
-18 files overlaid, `./run.sh --sim --strategy`, nothing else present -- no `tools/`, no
-`tests/`, no `sweeps/`:
+Pristine `git archive 657d59d` (the repo exactly as provided), the submission's 43 files
+overlaid on top, nothing else:
 
-- all six containers up; quoter, taker and hedger all trading
+- `tests/run_tests.sh unit` from the clean tree: Go tests pass, 29 Python tests pass
+- `./run.sh --sim --strategy`: all six containers up, quoter, taker and hedger all trading
 - **0** rejects, errors or tracebacks across all three seats
-- desk exposure over 162 samples: mean 7.5, median 7, p95 17, max 22, **0%** at or above 25
-- the two references to omitted tooling are inert: `run.sh` guards its call with
-  `[ -x ./tools/run_summary.sh ] && ... || true`, and the `docker-compose.yml` mention is
-  inside a comment
+- desk exposure over 154 samples: mean 5.7, median 5, p95 13, max 16, **0%** at or above 25
+  (no hedge fired in this window -- the desk never reached the threshold of 20)
+- the quoter reports `useref=true` at startup and `ref=own` thereafter, which is the
+  lead-detection bug above, now visible in the log rather than silent
+
+An earlier verification ran the same way against a reduced 18-file package with the
+tooling stripped out, and passed identically: `run.sh` guards its summariser call with
+`[ -x ./tools/run_summary.sh ] && ... || true`, so the desk runs with or without it.
 
 **What survives.** The compaction stands: the code reads better and measures the same,
 which was the point of it. The deleted config was a genuine defect -- `UseRef` really
