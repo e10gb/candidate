@@ -70,12 +70,16 @@ risk="$(grep -o 'held=[-0-9]*' "$tmp/h.log" | cut -d= -f2 | awk -v d="$DURATION"
 # which is higher than the unconditional average, so the realised spread ran far
 # wider than the parameters suggested. Fill rate is the other half of the picture
 # -- a spread nobody crosses earns nothing.
-spread="$(grep -oE 'bid=[0-9]+x[0-9]+ ask=[0-9]+x[0-9]+' "$tmp/q.log" |
-  sed -E 's/bid=([0-9]+)x[0-9]+ ask=([0-9]+)x[0-9]+/\1 \2/' | awk '
-  {w=$2-$1; n++; s+=w; if(w>mx)mx=w; a[n]=w}
-  END{ if(!n){print "- - -"; exit}
-       for(i=1;i<=n;i++)for(j=i+1;j<=n;j++)if(a[j]<a[i]){t=a[i];a[i]=a[j];a[j]=t}
-       printf "%d %.0f %d", a[int(n/2)+1], s/n, mx }')"
+  # Sorted with sort(1), not in awk. This was an insertion sort over every quote
+  # line: fine at a few thousand, quadratic past that. When reference pricing was
+  # restored the quoter repriced far more often, the line count jumped, and a 240s
+  # benchmark sat in this loop for 25 minutes looking exactly like a hung exchange.
+  spread="$(grep -oE 'bid=[0-9]+x[0-9]+ ask=[0-9]+x[0-9]+' "$tmp/q.log" |
+    sed -E 's/bid=([0-9]+)x[0-9]+ ask=([0-9]+)x[0-9]+/\1 \2/' |
+    awk '{print $2-$1}' | sort -n | awk '
+    {n++; s+=$1; a[n]=$1}
+    END{ if(!n){print "- - -"; exit}
+         printf "%d %.0f %d", a[int(n/2)+1], s/n, a[n] }')"
 read -r spmed spmean spmax <<<"$spread"
 qfills="$(grep -o 'fills=[0-9]*' "$tmp/q.log" | tail -1 | cut -d= -f2)"
 

@@ -1,0 +1,6 @@
+# One configuration per line: label, then any KEY=VALUE overrides.
+# Run with:  tools/sweep.sh sweeps/example.txt -d 240 -r 5
+baseline
+pull-20            QUOTER_PULL_MOVE=20
+pull-35            QUOTER_PULL_MOVE=35
+taker-reversion    TAKER_MODE=reversion

@@ -1,0 +1,5 @@
+# Does the desk stay flat when the quoter is far busier?
+# A profitable quoter is a busier one -- it gets crossed rather than run over --
+# so this stresses the risk control with ~6x the fill rate.
+normal-activity
+high-activity   QUOTER_MAX_EDGE=3 QUOTER_EDGE=1

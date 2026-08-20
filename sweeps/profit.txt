@@ -1,0 +1,7 @@
+# Does the desk have a path to profit at the shipped settings?
+#   shipped        - momentum taker, hedger always crosses (URGENT clamped to THRESH)
+#   patient        - give the passive hedge path room: URGENT above THRESH
+#   patient-rev    - the same, with the taker fading moves instead of following
+shipped
+patient        HEDGE_URGENT=35 HEDGE_PASSIVE_MS=800
+patient-rev    HEDGE_URGENT=35 HEDGE_PASSIVE_MS=800 TAKER_MODE=reversion

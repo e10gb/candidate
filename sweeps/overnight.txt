@@ -1,0 +1,17 @@
+# The overnight sweep the tooling sizes for: ~21 runs to resolve an effect of
+# 1,000 against a run-to-run stdev of ~5,500. Everything shipped was chosen from
+# 3-5 runs, which cannot separate these -- this is the honest sample size.
+#
+#   tools/sweep.sh sweeps/overnight.txt -d 240 -r 21     (~8 hours)
+#   tools/sweep.sh sweeps/overnight.txt -d 240 -r 7      (~3 hours, indicative)
+#
+# Results append to runs/sweep-<timestamp>.csv with per-config 95% intervals, so
+# it can be stopped early and still read.
+shipped
+taker-reversion   TAKER_MODE=reversion
+hedge-thresh-12   HEDGE_THRESH=12
+hedge-thresh-30   HEDGE_THRESH=30
+quoter-maxpos-20  QUOTER_MAX_POS=20
+edge-cap-20       QUOTER_MAX_EDGE=20
+pull-on-lead      QUOTER_PULL_MOVE=6
+two-contracts     QUOTER_FEED=AAM6,AAU6

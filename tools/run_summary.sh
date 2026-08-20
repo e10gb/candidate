@@ -75,12 +75,16 @@ read -r dmax dmean dover <<<"$(grep -o 'held=[-0-9]*' "$H" | cut -d= -f2 | awk '
   {n++; a=($1<0?-$1:$1); s+=a; if(a>mx)mx=a; if(a>=25)o++}
   END{ if(!n){print "- - -"; exit} printf "%d %.2f %.0f", mx, s/n, 100*o/n }')"
 
+# Sorted with sort(1), not in awk. This was an insertion sort over every quote
+# line: fine at a few thousand, quadratic past that. When reference pricing was
+# restored the quoter repriced far more often, the line count jumped, and a 240s
+# benchmark sat in this loop for 25 minutes looking exactly like a hung exchange.
 read -r spmed spmax <<<"$(grep -oE 'bid=[0-9]+x[0-9]+ ask=[0-9]+x[0-9]+' "$Q" |
-  sed -E 's/bid=([0-9]+)x[0-9]+ ask=([0-9]+)x[0-9]+/\1 \2/' | awk '
-  {w=$2-$1; n++; a[n]=w; if(w>mx)mx=w}
+  sed -E 's/bid=([0-9]+)x[0-9]+ ask=([0-9]+)x[0-9]+/\1 \2/' |
+  awk '{print $2-$1}' | sort -n | awk '
+  {n++; a[n]=$1}
   END{ if(!n){print "- -"; exit}
-       for(i=1;i<=n;i++)for(j=i+1;j<=n;j++)if(a[j]<a[i]){t=a[i];a[i]=a[j];a[j]=t}
-       printf "%d %d", a[int(n/2)+1], mx }')"
+       printf "%d %d", a[int(n/2)+1], a[n] }')"
 
 read -r qposmean qposmax <<<"$(grep -o 'pos=[-0-9]*' "$Q" | cut -d= -f2 | awk '
   {n++; a=($1<0?-$1:$1); s+=a; if(a>mx)mx=a}
