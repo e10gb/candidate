@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 
 SECS="${1:-60}"
 SENDER="${2:-QUOTE001}"
-FEED="${FEED:-AAH6}"
+FEED="${FEED:-${HEDGER_FEED:-${TAKER_FEED:-AAH6}}}"
 export NATS_URL="${NATS_URL:-nats://localhost:4222}"
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT

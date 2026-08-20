@@ -125,11 +125,30 @@ printf '%s\n' "${results[@]}" | awk '
   END{ if(!n) exit
        m=s/n; for(i=1;i<=n;i++) v+=(a[i]-m)^2
        sd=(n>1)?sqrt(v/(n-1)):0
+       se=(n>1)?sd/sqrt(n):0
        printf "mean %.0f   stdev %.0f   min %.0f   max %.0f\n", m, sd, mn, mx
-       # A mean smaller than the spread of the runs is not a result.
-       if (sd>0 && (m<0?-m:m) < sd) print "VERDICT: indistinguishable from zero at this sample size"
-       else if (m>0) print "VERDICT: positive, and larger than the run-to-run spread"
-       else print "VERDICT: negative, and larger than the run-to-run spread" }'
+       # Standard error, not standard deviation, is what says whether the mean is
+       # real. ~2 SE either side is the 95%% interval; if it straddles zero the
+       # sign of the mean is not established, however clean the runs looked.
+       if (se>0) printf "95%% CI:   [%.0f, %.0f]   (mean +/- 2 standard errors)\n",
+                         m-2*se, m+2*se
+       if (se>0 && (m<0?-m:m) < 2*se)
+         print "VERDICT: indistinguishable from zero -- the interval spans it"
+       else if (m>0) print "VERDICT: positive at this sample size"
+       else print "VERDICT: negative at this sample size"
+       # How many runs would settle it? n scales with (sd/effect)^2, so this is
+       # the honest price of an answer rather than a guess dressed as one.
+       if (sd>0 && m!=0) {
+         need=int(4*(sd*sd)/(m*m))+1
+         printf "to resolve an effect this size at 95%%: ~%d runs (have %d)\n", need, n
+       }
+       if (sd>0) {
+         for (e=1000; e<=10000; e+=1000) {
+           need=int(4*(sd*sd)/(e*e))+1
+           if (e==1000 || e==5000 || e==10000)
+             printf "  to detect %5d: ~%d runs\n", e, need
+         }
+       } }'
 
 printf '\ndesk exposure, pooled over every repeat (held at the exchange):\n'
 sort -n "$pool" | awk '
