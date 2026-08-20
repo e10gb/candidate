@@ -35,10 +35,6 @@ type config struct {
 	EdgeVolMult  float64
 	MaxEdgeTicks float64
 	VolWindow    time.Duration
-	// A second, much shorter volatility horizon. The edge takes whichever is
-	// wider, so a burst widens quotes within FastVolWindow instead of waiting for
-	// the slow window to notice.
-	FastVolWindow time.Duration
 	// Leave the market outright for PullFor after the mid moves PullMove or more
 	// within PullWindow. 0 disables. Pulling rather than widening: widening forces
 	// a cancel-and-replace, which posts a fresh order into the move.
@@ -49,11 +45,6 @@ type config struct {
 	// matter how much inventory skew wants to give away. Getting flat below this
 	// is the hedger's job.
 	MinEdgeTicks float64
-	// Tiers of quotes per side. 2 posts a tight small inner quote as well as the
-	// wide one, to earn calm-market flow that a single wide quote forfeits.
-	Tiers         int
-	InnerEdgeFrac float64 // inner tier's edge, as a fraction of the full edge
-	InnerSizeFrac float64 // inner tier's size, as a fraction of the clip
 	// Price off whichever sibling contract on the same underlying is most active,
 	// if any is more active than the one we quote. Discovered at runtime rather
 	// than configured, so it needs no knowledge of the grading market's listings.
@@ -102,27 +93,20 @@ func loadConfig() config {
 		MaxEdgeTicks: envFloat("QUOTER_MAX_EDGE", 20),
 		VolWindow: time.Duration(envInt("QUOTER_VOL_WINDOW_MS", 2000)) *
 			time.Millisecond,
-		FastVolWindow: time.Duration(envInt("QUOTER_FAST_VOL_MS", 0)) *
-			time.Millisecond,
 		PullMove: envFloat("QUOTER_PULL_MOVE", 0),
 		PullWindow: time.Duration(envInt("QUOTER_PULL_WINDOW_MS", 200)) *
 			time.Millisecond,
 		PullFor: time.Duration(envInt("QUOTER_PULL_MS", 300)) * time.Millisecond,
-		// Trialled at 2 and measured worse, so it ships off. A tight inner quote
-		// tripled the fill count and halved the realised spread exactly as
-		// intended, but the extra flow was not profitable: the quoter's own PnL did
-		// not improve, the inventory it generated pushed hedger volume from ~236 to
-		// ~620 lots, and mean desk exposure rose from 1.7 to 2.6-2.9 in both runs.
-		// The easy flow in this market is easy because it is adversely selected.
-		// Kept configurable -- in a market with more benign two-way flow it is the
-		// right shape.
+		// Price off the busiest sibling contract when one leads us. On by
+		// default: quoting a quiet month off its own thin mid is how a maker
+		// ends up last to know. A compaction pass once deleted these three
+		// lines while leaving the code that reads them, so UseRef silently
+		// took Go's zero value and reference pricing was off for a whole
+		// sweep -- worth ~6,300 per 240s run. TestConfigFromEnv guards it now.
 		UseRef:     envInt("QUOTER_USE_REF", 1) != 0,
 		BasisAlpha: envFloat("QUOTER_BASIS_ALPHA", 0.05),
 		RefStale: time.Duration(envInt("QUOTER_REF_STALE_MS", 2000)) *
 			time.Millisecond,
-		Tiers:         envInt("QUOTER_TIERS", 1),
-		InnerEdgeFrac: envFloat("QUOTER_INNER_EDGE_FRAC", 0.4),
-		InnerSizeFrac: envFloat("QUOTER_INNER_SIZE_FRAC", 0.4),
 		// Auto by default: the exchange states its per-feed limit in EX_META and
 		// the desk had been guessing instead of asking. Locally max_tps is 0
 		// (unlimited), so auto runs the quoter at the market's own event
@@ -216,9 +200,9 @@ func main() {
 		log.Fatalf("connect %s: %v", cfg.NatsURL, err)
 	}
 	defer nc.Close()
-	log.Printf("%s quoting %v clip=%d maxpos=%d edgefloor=%.1f skewfrac=%.1f",
+	log.Printf("%s quoting %v clip=%d maxpos=%d edgefloor=%.1f skewfrac=%.1f useref=%v",
 		cfg.Sender, splitFeeds(cfg.Feed), cfg.Clip, cfg.MaxPos, cfg.EdgeTicks,
-		cfg.SkewFrac)
+		cfg.SkewFrac, cfg.UseRef)
 
 	// One quoter per contract. They share an order-id allocator, because ids are
 	// consumed per *sender* rather than per feed, and a NATS connection; they

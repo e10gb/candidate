@@ -77,12 +77,8 @@ type quoter struct {
 	ticks   map[string]int
 	refFeed string
 
-	// One resting order per tier per side. Tier 0 is the inner quote when two
-	// tiers are configured: tight and small, to earn the calm-market flow that a
-	// single wide quote forfeits. The outer tier carries the size and sits far
-	// enough out to survive a sweep.
-	bids []resting
-	asks []resting
+	bid resting
+	ask resting
 
 	quoteMu sync.Mutex    // serialises requote cycles
 	wake    chan struct{} // coalescing signal: capacity 1
@@ -94,8 +90,6 @@ func newQuoter(nc *nats.Conn, cfg config, g *ids) *quoter {
 		nc:    nc,
 		cl:    newClient(nc, cfg.Sender, cfg.Feed, cfg.MaxTPS, cfg.MaxBurst, g),
 		wake:  make(chan struct{}, 1),
-		bids:  make([]resting, cfg.Tiers),
-		asks:  make([]resting, cfg.Tiers),
 		ticks: map[string]int{},
 	}
 }
@@ -137,14 +131,10 @@ func (q *quoter) onBBO(m *nats.Msg) {
 }
 
 // onAnyBBO watches every contract's top of book so the leading one can be picked
-// by observation. Feeds on the same underlying share a two-character prefix
-// (PROTOCOL.md), which is what makes them comparable at all.
+// by observation. Same underlying = same two-character prefix (PROTOCOL.md).
 //
-// The rule: price off the busiest sibling, unless that is us. Activity is a
-// reasonable proxy for which contract the market moves first, and the
-// "unless that is us" clause matters -- quoting the most active contract and
-// then pricing it off a quieter sibling would import lag rather than remove it,
-// which is the exact mistake this is meant to avoid.
+// Rule: price off the busiest sibling, unless that is us -- pricing the most
+// active contract off a quieter one would import lag rather than remove it.
 func (q *quoter) onAnyBBO(m *nats.Msg) {
 	f := strings.Fields(string(m.Data))
 	if len(f) < 6 || len(f[1]) < 2 {
@@ -178,13 +168,10 @@ func (q *quoter) onAnyBBO(m *nats.Msg) {
 
 // onRefBBO tracks the leading instrument and the basis between it and ours.
 //
-// The basis is learned rather than assumed: we only know the two contracts are
-// related, not by how much. It must adapt *slowly* (BasisAlpha small) -- it stands
-// for the structural offset between the contracts, not the transient lag we are
-// trying to trade. Learn it quickly and it absorbs the lead's move on the very
-// tick we wanted to react to, and the signal vanishes. Slow adaptation also makes
-// this safe if the two are unrelated: the basis converges on whatever difference
-// exists and we end up quoting around our own mid.
+// The basis is learned, not assumed, and must adapt *slowly*: it stands for the
+// structural offset between the contracts, not the lag we are trying to trade.
+// Learn it fast and it absorbs the lead's move on the very tick we wanted to
+// react to. Slow adaptation is also what makes an unrelated "lead" harmless.
 func (q *quoter) onRefBBO(m *nats.Msg) {
 	f := strings.Fields(string(m.Data))
 	if len(f) < 6 {
@@ -214,12 +201,8 @@ func (q *quoter) onRefBBO(m *nats.Msg) {
 	q.signal() // the lead moved: our fair value has moved with it
 }
 
-// fairValue is what we price around. Caller must hold q.mu.
-//
-// Preference is the reference instrument plus the learned basis, because it moves
-// first; our own mid is the fallback. In the sample market the back months are
-// quoted at `front_fair + offset` by everyone else (sim/market.py:167), so a
-// quoter pricing off its own stale book is repriced last and picked off first.
+// fairValue is what we price around: the reference contract plus the learned
+// basis when one leads, our own mid otherwise. Caller must hold q.mu.
 func (q *quoter) fairValue() float64 {
 	own := float64(q.bidPx+q.askPx) / 2
 	if !q.cfg.UseRef || !q.refOK || !q.basisSet {
@@ -254,11 +237,9 @@ func (q *quoter) onOwnMD(m *nats.Msg) {
 	case "E", "T":
 		// <ts> <E|T> <incoming:17> <resting:17> <volume> <price> <matchid> <B|S>
 		//
-		// Not duplicates: our subject carries E when we were the resting side of a
-		// match and T when we crossed. We are built to stay passive, so E is the
-		// normal case, but a limit order can still cross if the book moves between
-		// reading the BBO and the order landing -- handling only E would silently
-		// lose those fills and leave the position wrong.
+		// Not duplicates: E when we were the resting side, T when we crossed. We
+		// stay passive so E is normal, but a limit can still cross if the book
+		// moves before it lands -- handling only E loses those fills silently.
 		if len(f) < 8 {
 			return
 		}
@@ -361,41 +342,12 @@ func (q *quoter) pushMid(mid float64) {
 	}
 }
 
-// volatilityOver is the standard deviation of the mid over the most recent
-// `window`, in price units. Caller must hold q.mu.
-func (q *quoter) volatilityOver(window time.Duration) float64 {
-	cut := time.Now().Add(-window)
-	i := 0
-	for i < len(q.mids) && q.mids[i].at.Before(cut) {
-		i++
-	}
-	seg := q.mids[i:]
-	if len(seg) < 3 {
-		return 0
-	}
-	var sum float64
-	for _, s := range seg {
-		sum += s.mid
-	}
-	mean := sum / float64(len(seg))
-	var sq float64
-	for _, s := range seg {
-		d := s.mid - mean
-		sq += d * d
-	}
-	return math.Sqrt(sq / float64(len(seg)))
-}
-
-// volatility is the standard deviation of the mid over the recent window, in
-// price units. Caller must hold q.mu.
+// volatility is the stdev of the mid over the recent window, in price units.
+// Caller must hold q.mu.
 //
-// This is what makes the edge adaptive instead of fitted. A market maker's spread
-// has to cover how far the price moves while it is holding, and that distance is
-// a property of the market, not a constant. On the sample market a volatility-
-// sized edge beat the original fixed edge of 2 by roughly an order of magnitude,
-// repeatably. The specific wide value that worked there is just that market's
-// move size memorised, and TASK.md says grading uses a different one: measuring
-// the move and pricing off it transfers, the number does not.
+// This makes the edge adaptive rather than fitted: a spread has to cover how far
+// the price moves while you hold, which is a property of the market. A fixed
+// number would just be this sim's move size memorised.
 func (q *quoter) volatility() float64 {
 	if len(q.mids) < 3 {
 		return 0
@@ -414,12 +366,8 @@ func (q *quoter) volatility() float64 {
 }
 
 // checkPullRef is the same guard driven by the *leading* contract, which is the
-// point of it: the measured failure is background quoters repricing off the front
-// month and crossing our resting quotes as the mid passes through them, at which
-// instant we capture no spread at all (measured edge at fill: -0.78 to +1.05 per
-// lot, whatever width we quote). Our own mid moving is not a warning -- by then
-// those orders have already traded with us. The lead moving is.
-// Caller must hold q.mu.
+// point: our own mid moving is not a warning, because by then the repricing
+// orders have already traded with us. The lead moving is. Caller must hold q.mu.
 func (q *quoter) checkPullRef(mid float64) {
 	if q.cfg.PullMove <= 0 {
 		return
@@ -453,18 +401,11 @@ func (q *quoter) checkPullRef(mid float64) {
 	}
 }
 
-// checkPull takes us out of the market when the price has just moved sharply.
-// Caller must hold q.mu.
+// checkPull takes us out of the market after a sharp move. Caller must hold q.mu.
 //
-// Measured markout says the damage is a transient: -7.15 per lot at 100ms after a
-// fill, recovering by 500ms. The obvious response -- widen when the market moves --
-// was tried and measured *worse* (-6.98 to -16.74), and the reason is mechanical:
-// widening changes our target price, so reconcile cancels and re-adds, and the
-// re-add puts a brand new order into the middle of the move. Pulling has no such
-// failure mode. We cancel and stay out; there is nothing left to hit.
-//
-// The distinction is the whole point of this: it is not "quote further away", it
-// is "do not be in the book at all for the moment it takes the move to land".
+// Pulling, not widening: widening changes the target price, so reconcile cancels
+// and re-adds, and the re-add drops a fresh order into the middle of the move --
+// measured worse. Pulling has no such failure mode; there is nothing left to hit.
 func (q *quoter) checkPull(mid float64) {
 	if q.cfg.PullMove <= 0 || len(q.mids) < 2 {
 		return
@@ -493,34 +434,14 @@ func (q *quoter) checkPull(mid float64) {
 
 // edge returns the half-spread to quote, in price units. Caller must hold q.mu.
 //
-// The cap matters more than it sounds. Volatility is sampled at the moments we
-// requote, and we requote when the market moves, so the edge is priced off
-// *conditional* volatility and runs much wider than the unconditional average
-// suggests: measured median quoted spread of 78 where the parameters implied ~60,
-// with the cap binding regularly and the widest quotes reaching 240 against a
-// market spread of 1-5.
-//
-// A price-relative form of this cap was tried and removed: it measured no better
-// and left two knobs doing one job. See NOTES.md.
+// The cap matters: volatility is sampled when we requote, and we requote when the
+// market moves, so the edge is priced off *conditional* volatility and runs wider
+// than the parameters imply -- uncapped it reached a quoted spread of 240 against
+// a market spread of 1-5.
 func (q *quoter) edge() float64 {
 	e := q.cfg.EdgeTicks // floor: never quote tighter than this
 	if q.cfg.EdgeVolMult > 0 {
-		// Two horizons, widest wins. The slow one sets the baseline; the fast one
-		// is what catches a move in progress.
-		//
-		// Measured markout showed the damage is a sharp transient: -7.15 per lot
-		// 100ms after a fill, recovering to -0.49 by 500ms. A 2s volatility window
-		// cannot see a 100ms event, so the edge stayed narrow through exactly the
-		// moment it needed to be wide -- the background quoters reprice off the
-		// front month and sweep through our stale quotes before the slow estimate
-		// has moved at all.
-		v := q.volatility()
-		if q.cfg.FastVolWindow > 0 {
-			if fast := q.volatilityOver(q.cfg.FastVolWindow); fast > v {
-				v = fast
-			}
-		}
-		if v *= q.cfg.EdgeVolMult; v > e {
+		if v := q.cfg.EdgeVolMult * q.volatility(); v > e {
 			e = v
 		}
 	}
@@ -530,18 +451,8 @@ func (q *quoter) edge() float64 {
 	return e
 }
 
-// live returns pointers to every resting slot, both sides, all tiers.
-// Caller must hold q.mu.
-func (q *quoter) live() []*resting {
-	out := make([]*resting, 0, len(q.bids)+len(q.asks))
-	for i := range q.bids {
-		out = append(out, &q.bids[i])
-	}
-	for i := range q.asks {
-		out = append(out, &q.asks[i])
-	}
-	return out
-}
+// live returns our resting slots. Caller must hold q.mu.
+func (q *quoter) live() []*resting { return []*resting{&q.bid, &q.ask} }
 
 // target is the quote we want on one side; vol == 0 means "do not quote".
 type target struct {
@@ -549,98 +460,62 @@ type target struct {
 	vol int
 }
 
-// desired computes every tier on both sides from the book and our inventory.
-//
-// With two tiers the inner one is tighter and smaller: a single wide quote is
-// safe against sweeps but forfeits all the calm-market flow, and fill counts fell
-// to a few dozen per run because of it. The inner quote earns that flow while
-// risking little; the outer keeps the size where a sweep cannot reach it cheaply.
-func (q *quoter) desired() (bids, asks []target, ok bool) {
+// desired computes both sides from the book and our inventory.
+func (q *quoter) desired() (bid, ask target, ok bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if !q.bidOK || !q.askOK || q.askPx <= q.bidPx {
-		return nil, nil, false // one-sided or crossed: no fair value
+		return target{}, target{}, false // one-sided or crossed: no fair value
 	}
 	if time.Now().Before(q.pullUntil) {
-		return nil, nil, false // a sharp move just landed: be out of the book
+		return target{}, target{}, false // a sharp move just landed: stay out
 	}
 
 	fair := q.fairValue()
 	edge := q.edge()
-	// Inventory skew: push both quotes away from the position we are carrying, so
-	// the side that flattens us is the attractive one. This is what makes it a
-	// liquidity strategy rather than a directional one -- the mid drifts far more
-	// than the spread pays.
-	//
-	// Expressed as a fraction of the *current edge*, not an absolute tick count.
-	// It was absolute (4 ticks) and chosen when the edge was a fixed 2, i.e. a 200%
-	// lean at full inventory. Once the edge became volatility-sized and capped at
-	// 20, that same 4 was a 20% lean and the quoter had all but stopped managing
-	// its own inventory -- pushing the work onto the hedger, which pays the spread
-	// to do what skew does for free.
+	// Lean against inventory so the flattening side is the attractive one, as a
+	// fraction of the current edge -- an absolute tick count stops meaning
+	// anything once the edge is volatility-sized.
 	skew := q.cfg.SkewFrac * edge * float64(q.position) / float64(q.cfg.MaxPos)
+	bid.px = int(math.Round(fair - edge - skew))
+	ask.px = int(math.Round(fair + edge - skew))
 
-	// Remaining room before the position limit, shared across tiers: the inner
-	// quote is filled first, so it gets first call on the capacity.
-	buyRoom := q.cfg.MaxPos - q.position
-	sellRoom := q.cfg.MaxPos + q.position
-
-	bids = make([]target, len(q.bids))
-	asks = make([]target, len(q.asks))
-	for i := range bids {
-		eFrac, sFrac := 1.0, 1.0
-		if len(bids) > 1 && i == 0 {
-			eFrac, sFrac = q.cfg.InnerEdgeFrac, q.cfg.InnerSizeFrac
-		}
-		e := edge * eFrac
-		b := target{px: int(math.Round(fair - e - skew))}
-		a := target{px: int(math.Round(fair + e - skew))}
-
-		// Minimum-edge floor. Skew is allowed to make the side that flattens us
-		// more attractive, but never past the point where the fill stops being
-		// profitable. Paying to reduce inventory is the hedger's job.
-		//
-		// Only the attractive side is floored. The discouraging side stays
-		// unbounded -- quoting stingier than fair is always safe.
-		if cap := int(math.Floor(fair - q.cfg.MinEdgeTicks)); b.px > cap {
-			b.px = cap
-		}
-		if floor := int(math.Ceil(fair + q.cfg.MinEdgeTicks)); a.px < floor {
-			a.px = floor
-		}
-
-		// Prices must sit on the instrument's tick grid, rounding always away
-		// from fair -- bid down, ask up -- so the minimum edge survives it.
-		// Untested against a live tick>1 book: the local exchange lists only
-		// tick=1, so this path rests on EX_META and the reject probe alone.
-		if t := q.cfg.TickSize; t > 1 {
-			b.px = floorToTick(b.px, t)
-			a.px = ceilToTick(a.px, t)
-		}
-
-		size := int(math.Round(float64(q.cfg.Clip) * sFrac))
-		b.vol = clamp(size, 0, buyRoom)
-		a.vol = clamp(size, 0, sellRoom)
-		buyRoom -= b.vol
-		sellRoom -= a.vol
-
-		// Stay passive: a limit that crosses executes immediately, making us the
-		// aggressor and paying the spread we are trying to earn.
-		if b.px >= q.askPx {
-			b.vol = 0
-		}
-		if a.px <= q.bidPx {
-			a.vol = 0
-		}
-		bids[i], asks[i] = b, a
+	// Minimum-edge floor: skew may make the flattening side attractive, never
+	// unprofitable. Clearing inventory at a loss is the hedger's job. Only the
+	// attractive side is floored; quoting stingier than fair is always safe.
+	if cap := int(math.Floor(fair - q.cfg.MinEdgeTicks)); bid.px > cap {
+		bid.px = cap
 	}
-	return bids, asks, true
+	if floor := int(math.Ceil(fair + q.cfg.MinEdgeTicks)); ask.px < floor {
+		ask.px = floor
+	}
+	// Prices sit on the instrument's tick grid, rounded away from fair so the
+	// minimum edge survives it. Untested against a live tick>1 book: the local
+	// exchange lists only tick=1.
+	if t := q.cfg.TickSize; t > 1 {
+		bid.px = floorToTick(bid.px, t)
+		ask.px = ceilToTick(ask.px, t)
+	}
+
+	// Never quote a size that could breach the position limit.
+	bid.vol = clamp(q.cfg.Clip, 0, q.cfg.MaxPos-q.position)
+	ask.vol = clamp(q.cfg.Clip, 0, q.cfg.MaxPos+q.position)
+
+	// Stay passive: a limit that crosses executes immediately, making us the
+	// aggressor and paying the spread we are trying to earn. With a positive
+	// MinEdgeTicks the floor above already guarantees this, so this is a guard.
+	if bid.px >= q.askPx {
+		bid.vol = 0
+	}
+	if ask.px <= q.bidPx {
+		ask.vol = 0
+	}
+	return bid, ask, true
 }
 
-// floorToTick snaps a price down to the grid; negative prices are legal here
-// (probed: the band is ref +/- band, and bids below zero are accepted), so this
-// floors mathematically rather than truncating toward zero.
+// floorToTick snaps a price down to the grid. Negative prices are legal here
+// (probed), so this floors mathematically rather than truncating toward zero.
 func floorToTick(px, tick int) int {
 	m := px % tick
 	if m < 0 {
@@ -650,11 +525,10 @@ func floorToTick(px, tick int) int {
 }
 
 func ceilToTick(px, tick int) int {
-	f := floorToTick(px, tick)
-	if f == px {
-		return px
+	if f := floorToTick(px, tick); f != px {
+		return f + tick
 	}
-	return f + tick
+	return px
 }
 
 func clamp(v, lo, hi int) int {
@@ -667,8 +541,8 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
-// requoteLoop owns all order entry, so network calls never block the NATS
-// callbacks that feed us market data.
+// requoteLoop owns all order entry, so network calls never block the market-data
+// callbacks.
 func (q *quoter) requoteLoop(ctx context.Context) {
 	// A slow tick refreshes quotes even when the top of book is static, so a
 	// dropped reply or a missed event cannot leave us un-quoted indefinitely.
@@ -692,15 +566,13 @@ func (q *quoter) requote() {
 	q.quoteMu.Lock()
 	defer q.quoteMu.Unlock()
 
-	bids, asks, ok := q.desired()
+	bid, ask, ok := q.desired()
 	if !ok {
 		q.cancelAll()
 		return
 	}
-	for i := range bids {
-		q.reconcile(&q.bids[i], bids[i], 'B')
-		q.reconcile(&q.asks[i], asks[i], 'S')
-	}
+	q.reconcile(&q.bid, bid, 'B')
+	q.reconcile(&q.ask, ask, 'S')
 }
 
 // reconcile brings one side to its target, leaving an already-correct order
@@ -766,15 +638,9 @@ func (q *quoter) cancelAll() {
 
 // status reports position and mark-to-market PnL once a second, mirroring the
 // taker's strat.<sender>.status convention.
-// markPrice values inventory. Preference order: the live mid; the side we would
-// actually have to trade against to get flat; the last price we saw. Staleness is
-// reported to the caller rather than hidden.
-//
-// The previous version added position*mid only when the book happened to be
-// two-sided, and otherwise reported raw cash as PnL. In the full-stack run the
-// book emptied and it printed pnl=9065 while short 14 lots; the real figure was
-// about -385. A valuation that silently drops the position is worse than none.
-//
+// markPrice values inventory: the live mid, else the side we would have to trade
+// against to get flat, else the last price seen. Staleness is reported rather
+// than hidden -- a valuation that silently drops the position reads as profit.
 // Caller must hold q.mu.
 func (q *quoter) markPrice() (px float64, fresh, ok bool) {
 	switch {
@@ -794,11 +660,9 @@ func (q *quoter) markPrice() (px float64, fresh, ok bool) {
 	return 0, false, false
 }
 
-// liqPrice values inventory at what it would actually fetch if closed right now:
-// a long sells into the bid, a short buys from the ask. markPrice uses the mid,
-// which is the fair value of the position but not what you would receive for it.
-// The session ends by liquidating whatever is left against the book, so this is
-// the number that survives contact with the close. Caller must hold q.mu.
+// liqPrice values inventory at what it would fetch if closed now -- long sells
+// into the bid, short buys from the ask. The session ends by liquidating, so this
+// is the number that survives the close. Caller must hold q.mu.
 func (q *quoter) liqPrice() (float64, bool) {
 	switch {
 	case q.position > 0 && q.bidOK:
@@ -832,25 +696,26 @@ func (q *quoter) status() string {
 	if px, lok := q.liqPrice(); lok {
 		liq = fmt.Sprintf("%.0f", float64(q.cash)+float64(q.position)*px)
 	}
-	return fmt.Sprintf("%s pos=%d cash=%d pnl=%s liq=%s fills=%d bid=%s ask=%s",
-		q.cfg.Feed, q.position, q.cash, pnl, liq, q.fills,
-		fmtQuote(best(q.bids, true)), fmtQuote(best(q.asks, false)))
-}
-
-// best returns the tightest live quote on a side: the highest bid, the lowest
-// ask. That is the price we are actually showing the market, which is what the
-// status line and the benchmark harness care about.
-func best(rs []resting, highest bool) resting {
-	var out resting
-	for _, r := range rs {
-		if !r.live() {
-			continue
-		}
-		if !out.live() || (highest && r.px > out.px) || (!highest && r.px < out.px) {
-			out = r
-		}
+	// Which contract we are actually pricing off. Reference pricing once switched
+	// itself off for a whole sweep -- a deleted config assignment, so UseRef held
+	// Go's zero value -- and nothing in the logs would have shown it. "ref=own"
+	// is a real state (we are the busiest contract, so we are the lead); "ref=off"
+	// means the feature is disabled, which should never be true by default.
+	ref := "off"
+	switch {
+	case !q.cfg.UseRef: // disabled: never true by default, see TestConfigFromEnv
+	case q.refFeed == "":
+		ref = "own" // we are the busiest contract, so we are the lead
+	case !q.refOK || !q.basisSet:
+		ref = q.refFeed + "?" // a lead exists but we cannot use it yet
+	case time.Since(q.refAt) > q.cfg.RefStale:
+		ref = q.refFeed + "!stale"
+	default:
+		ref = fmt.Sprintf("%s%+.0f", q.refFeed, q.basis)
 	}
-	return out
+	return fmt.Sprintf("%s pos=%d cash=%d pnl=%s liq=%s fills=%d ref=%s bid=%s ask=%s",
+		q.cfg.Feed, q.position, q.cash, pnl, liq, q.fills, ref,
+		fmtQuote(q.bid), fmtQuote(q.ask))
 }
 
 func fmtQuote(r resting) string {

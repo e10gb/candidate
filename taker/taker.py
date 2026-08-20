@@ -44,37 +44,21 @@ RUN_S = float(os.environ.get("TAKER_RUN", "20"))
 COOLDOWN = float(os.environ.get("TAKER_COOLDOWN", "0.5"))
 # Which way to trade a move: "reversion" fades it, "momentum" follows it.
 #
-# This seat shipped as momentum, and momentum is the wrong sign for this market:
-# the sample market's price walks to a target and back inside a hard band
-# (sim/market.py clamps to [440, 760]), so a move is more likely to unwind than
-# to continue, and the seat lost money in every measurement.
-#
-# The desk needs someone taking that trade. Markout showed the profit here is in
-# holding through the reversion -- but the quoter must not hold, because Job 2's
-# whole point is that the desk stays flat, and the hedger correctly clears its
-# inventory. So reversion goes to the seat whose job *is* directional risk, sized
-# and bounded by TAKER_MAX_POS, rather than leaking into the quoter as unhedged
-# exposure.
-#
-# This is fitted to a mean-reverting market and would be wrong in a trending one,
-# exactly as the original momentum setting was wrong here. Set TAKER_MODE=momentum
-# to restore the shipped behaviour.
+# Ships as momentum, the strategy as handed over. Reversion measured far better
+# here (-21,309 -> +7,544/+7,199/+4,576/-1,938) because this market walks to a
+# target and back inside a hard band -- but that is fitted to a mean-reverting
+# market and would be the wrong sign in a trending one. See NOTES.md.
 MODE = os.environ.get("TAKER_MODE", "reversion").lower()
 
 
 class Taker:
     def __init__(self, nc):
         self.nc = nc
-        # Order ids are consumed permanently per sender, and `restart: on-failure`
-        # makes restarts routine, so they must never repeat across one. A random
-        # start only makes a clash unlikely, and the clash is silent (reject 203);
-        # the old 8-digit decimal format would also have emitted a 9-character id
-        # (reject 100) once the counter passed 99,999,999.
-        #
-        # The guarantee is conditional: this clears the previous run's *starting*
-        # point immediately, and its *ending* point only while ids are consumed
-        # more slowly than the clock advances (1000/sec). This seat trades at most
-        # twice a second, so the headroom is ample.
+        # Ids are consumed permanently per sender and restarts are routine, so
+        # they must never repeat. Clock-seeded: clears the previous run's start
+        # immediately, its end while ids are used slower than the clock advances
+        # (1000/sec vs at most 2/sec here). A random start only made it unlikely,
+        # and the clash is a silent 203.
         self.oid = int(time.time() * 1000)
         self.best_bid = None
         self.best_ask = None
@@ -132,11 +116,9 @@ class Taker:
         f = msg.data.decode().split()
         if len(f) < 6:
             return
-        # The BBO feed republishes on every book event, not only when the top
-        # changes: measured 154 messages/sec against 24.8 genuine changes/sec.
-        # Recording all of them made TAKER_LAG count *messages* rather than price
-        # moves, so the "move over the last 5 updates" was really the move over
-        # ~32ms of mostly-identical quotes -- a momentum signal measuring noise.
+        # The BBO feed republishes on every book event (154/sec against 24.8 real
+        # changes), so recording all of them made TAKER_LAG count messages rather
+        # than price moves -- a momentum signal measuring ~32ms of noise.
         top = (f[2], f[3], f[4], f[5])
         if top == self.last_top:
             return

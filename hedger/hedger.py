@@ -9,19 +9,13 @@ held for a second is not -- but it only pays when it has to: modest exposure is
 first worked passively at the touch, and only crossed if that does not fill in
 HEDGE_PASSIVE_MS or the position grows past HEDGE_URGENT.
 
-Two decisions worth stating up front, both forced by what we found in the exchange
-(see NOTES.md):
+Two decisions forced by what the exchange actually does (see NOTES.md):
 
-1. Positions are derived from the exchange's own fill feed
-   (`ex.md.<FEED>.<sender>`), never from a seat's self-reported
-   `strat.<sender>.status`. The shipped taker reports `pos=0` while being unable to
-   trade at all, and books sells as buys once it can. A hedger that trusts its
-   siblings' bookkeeping inherits their bugs; the exchange cannot be wrong about
-   what it matched.
-
-2. `F` (fill-and-kill) orders fill *partially*, despite what CHANGELOG.md v2.3 and
-   sim/market.py both claim. Every send therefore reads the traded volume back off
-   the reply and the remainder is re-hedged on the next tick.
+1. Positions come from the exchange's own fill feed, never from a seat's
+   self-reported status. The shipped taker reported pos=0 while unable to trade
+   at all; a hedger trusting its siblings inherits their bugs.
+2. `F` orders fill *partially*, despite CHANGELOG v2.3 and sim/market.py both
+   claiming otherwise, so every send reads the traded volume off the reply.
 
 Config (env):
   NATS_URL         default nats://127.0.0.1:4222
@@ -74,14 +68,10 @@ SLIP = env("HEDGE_SLIP", 10, int)
 INTERVAL = env("HEDGE_INTERVAL", 0.05, float)
 MAX_TPS = env("HEDGE_MAX_TPS", 20, int)
 
-# Passive-first hedging. Crossing the spread on every hedge is the desk's largest
-# mechanical cost: measured around 4 price units per lot on ~200 lots per two
-# minutes. Modest exposure does not need that urgency -- TASK.md's own risk model
-# says a small position held for a while is cheap and a large one is not -- so we
-# first rest an order at the touch and only cross if it has not filled.
-#
-# URGENT is the size above which we stop being patient and take the spread hit
-# immediately. Below it, patience costs a little time and saves the spread.
+# Passive-first hedging: crossing on every hedge is the desk's largest mechanical
+# cost (~4 per lot). TASK.md's risk model says a small position held a while is
+# cheap and a large one is not, so modest exposure rests at the touch first and
+# only crosses if unfilled. URGENT is the size above which we stop being patient.
 URGENT = env("HEDGE_URGENT", 15, int)
 # URGENT below THRESH silently disables the passive path: every hedge is already
 # urgent the moment it triggers, so nothing is ever worked patiently. That is a
@@ -212,13 +202,10 @@ class Hedger:
             f = msg.data.decode().split()
             # <ts> <E|T> <incoming:17> <resting:17> <volume> <price> <matchid> <B|S>
             #
-            # Both types matter, and they are not duplicates of each other: a seat
-            # gets E on its own subject when it was the *resting* side of a match,
-            # and T when it was the *aggressor*. Verified by watching every
-            # ex.md.AAH6.* subject through a single trade -- the passive party's
-            # subject carried only E, the aggressor's only T. Handling just E (as
-            # this did at first) silently drops every fill of a seat that crosses
-            # the spread, which is every fill the hedger itself makes.
+            # Not duplicates: a seat gets E when it was the *resting* side and T
+            # when it was the *aggressor* (verified by watching every subject
+            # through one trade). Handling only E drops every fill made by
+            # crossing -- which is every fill the hedger itself makes.
             if len(f) < 8 or f[1] not in ("E", "T"):
                 return
             incoming_is_ours = f[2].startswith(prefix)
@@ -247,17 +234,11 @@ class Hedger:
                     self.passive_lots += vol
                 else:
                     self.crossed_lots += vol
-                # Retire this fill from the in-flight bridge -- but only if it
-                # was ever *on* the bridge. cross() adds to inflight; rest() does
-                # not, because a resting order has not traded. Retiring a passive
-                # fill here cancels the hedger's own position out of desk() and
-                # leaves real exposure invisible: measured desk=-4 while the seats
-                # actually held -44 between them, the desk reporting flat while
-                # carrying forty lots.
-                #
-                # The signed amount matters too: an earlier version retired by
-                # magnitude toward zero, which corrupted the count as soon as buy
-                # and sell hedges were outstanding together.
+                # Retire from the in-flight bridge, but only fills that were ever
+                # *on* it: cross() adds, rest() does not. Retiring a passive fill
+                # cancels our own position out of desk() -- measured desk=-4 while
+                # the seats held -44. Signed, not by magnitude: retiring toward
+                # zero corrupts the count when both directions are outstanding.
                 if incoming_is_ours and self.inflight:
                     left = self.inflight - signed
                     # A fill larger than what was outstanding, or a limit order
@@ -284,15 +265,11 @@ class Hedger:
     def desk(self):
         """Desk exposure, including anything fired but not yet echoed back.
 
-        The bridge is *self-healing*: it covers a round trip of milliseconds, so
-        anything still outstanding after INFLIGHT_TTL is stale and gets dropped.
-        Without that, any path which adds to inflight without producing a
-        confirming fill -- the hedger crossing into its own resting order is one,
-        since a self-match is no position change and is skipped -- leaves the
-        bridge permanently overstated and the desk blind to real exposure. It
-        reported flat while the seats held 40 lots between them. Positions come
-        from the exchange and are always right; the bridge is the only guess here,
-        so it is the part with an expiry on it."""
+        The bridge is self-healing: it covers a millisecond round trip, so
+        anything outstanding after INFLIGHT_TTL is stale and dropped. Without
+        that, any path adding to inflight without a confirming fill (a self-match
+        is skipped, for one) leaves the desk blind to real exposure. Positions
+        come from the exchange and are right; the bridge is the only guess."""
         if self.inflight and time.monotonic() - self.inflight_at > INFLIGHT_TTL:
             print(f"[hedger] dropping stale in-flight {self.inflight}", flush=True)
             self.inflight = 0

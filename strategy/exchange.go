@@ -14,12 +14,9 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// meta is one instrument's EX_META record: the exchange's own statement of the
-// contract's trading parameters. The seats had never read it -- every limit in
-// the desk was a hardcoded guess, which is wrong in both directions: a rate cap
-// guessed too high gets the sender disconnected in a market with a lower limit,
-// and one guessed too low leaves the quoter reacting at a fraction of the
-// market's real cadence, which is what being picked off is.
+// meta is the exchange's own statement of a contract's trading parameters.
+// Read rather than guessed: a rate cap guessed high gets the sender
+// disconnected, one guessed low leaves us reacting slower than the market.
 type meta struct {
 	tickSize      int
 	maxTPS        int
@@ -92,20 +89,16 @@ func (r reply) String() string {
 	return fmt.Sprintf("N %d %s", r.code, r.text)
 }
 
-// ids allocates order ids for one sender across every contract it trades.
-//
-// Shared deliberately: ids are consumed permanently *per sender*, not per feed,
-// so a quoter running several contracts must draw from one sequence. Two clients
-// each seeding from the wall clock would start within a millisecond of each other
-// and collide immediately -- and the collision is a silent 203, not a crash.
+// ids allocates order ids for one sender across every contract it trades. Shared
+// deliberately: ids are consumed per *sender*, not per feed, and two clock-seeded
+// allocators would start a millisecond apart and collide as silent 203s.
 type ids struct {
 	mu   sync.Mutex
 	next uint64
 }
 
-// newIDs seeds from the clock so a container restart resumes above everything the
-// previous run burned. Milliseconds since epoch (~1.8e12) fits inside the
-// 36^8 (~2.8e12) the protocol's 8 characters allow, good until ~2059.
+// newIDs seeds from the clock so a restart resumes above the previous run. ms
+// since epoch (~1.8e12) fits inside 36^8 (~2.8e12), good until ~2059.
 func newIDs() *ids {
 	return &ids{next: uint64(time.Now().UnixMilli())}
 }
@@ -136,12 +129,9 @@ type client struct {
 	mu  sync.Mutex
 	ids *ids
 
-	// Token bucket, not fixed spacing between requests. Repricing both sides is
-	// cancel+add twice, and with a fixed 1/maxTPS gap that serialised into ~200ms
-	// of forced waiting while sitting on stale quotes -- despite the measured
-	// sustained rate being 8/sec against a budget of 20. A bucket lets a burst
-	// through immediately and still bounds the sustained rate, which is the thing
-	// that actually risks the disconnect.
+	// Token bucket, not fixed spacing: repricing both sides is four requests, and
+	// a fixed 1/maxTPS gap serialised that into ~200ms on stale quotes while well
+	// under budget. Bursts pass; the sustained rate is what risks the disconnect.
 	tokens float64
 	burst  float64
 	rate   float64 // tokens per second
@@ -161,9 +151,8 @@ func newClient(nc *nats.Conn, sender, feed string, maxTPS, maxBurst int, g *ids)
 	}
 }
 
-// reserve takes one token and returns how long the caller must wait for it.
-// Letting tokens go negative is deliberate: it queues concurrent callers instead
-// of letting them all decide independently that they may go now.
+// reserve takes a token and returns how long to wait for it. Tokens go negative
+// deliberately: that queues concurrent callers rather than letting all through.
 func (c *client) reserve() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -190,10 +179,8 @@ const base36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 func (c *client) newOrderID() string { return c.ids.next8() }
 
-// request rate-limits, sends, and parses. Exceeding the exchange's per-feed
-// max_tps disconnects the sender outright (changelog v2.3) rather than merely
-// rejecting, so we throttle ourselves regardless of what the local
-// instruments file says the limit is.
+// request rate-limits, sends, and parses. Exceeding max_tps disconnects the
+// sender outright rather than rejecting, so we always throttle ourselves.
 func (c *client) request(msg string) (reply, error) {
 	if wait := c.reserve(); wait > 0 {
 		time.Sleep(wait)
@@ -245,30 +232,18 @@ func (c *client) add(side byte, vol, px int, typ byte) (string, int, error) {
 	return id, r.n, nil
 }
 
-// Reject codes that both mean "this order is not resting on the book", which is
-// precisely the state cancel() is trying to reach. Distinguished by experiment:
-//
-//	206 orderid not used   -- this sender never used the id at all
-//	305 orderid not active -- the id was used, but the order has since been
-//	                          cancelled or filled
-//
-// Neither is an error for us. 305 shows up routinely in the full-stack run when a
-// fill and a requote race: the fill removes the order a moment before we ask to
-// cancel it. Treating it as a failure made reconcile bail out while still holding
-// a record of an order that no longer exists, so that side stopped being requoted
-// until an unrelated C message happened to clear it.
+// Both mean "not resting on the book", which is the state cancel() wants, so
+// neither is an error. Distinguished by experiment: 206 = this sender never used
+// the id; 305 = it was used but has since been cancelled or filled. 305 is
+// routine -- a fill removes the order just before our cancel lands.
 const (
 	rejectOrderIDUnused = 206
 	rejectOrderInactive = 305
 )
 
-// cancel removes one resting order by id.
-//
-// Deliberately not using X (cancel-many): it does not reliably select by
-// side+price. Observed two of our own orders resting at 585 while
-// "X AAH6 B 585" reported 0 cancelled, and cancelling each by id immediately
-// afterwards worked. Per-id cancellation costs one request each, which the rate
-// limiter above absorbs.
+// cancel removes one resting order by id. Deliberately not X (cancel-many): it
+// does not reliably select by side and price -- two of our orders rested at 585
+// while "X AAH6 B 585" reported 0 cancelled, and per-id cancels then worked.
 func (c *client) cancel(id string) error {
 	r, err := c.request(fmt.Sprintf("%s C %s %s", c.sender, c.feed, id))
 	if err != nil {
